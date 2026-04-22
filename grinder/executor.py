@@ -2,18 +2,33 @@
 
 from __future__ import annotations
 
+import datetime
 import multiprocessing
 import random
 import threading
+from abc import ABC
 from multiprocessing import JoinableQueue, Process
 from queue import Empty, Queue, ShutDown
 from traceback import format_exception
 from typing import Any
 
 from django.tasks import TaskResult
+from django.tasks.backends.base import BaseTaskBackend
 from django.tasks.base import TaskContext, TaskError, TaskResultStatus, normalize_json
 from django.tasks.signals import task_enqueued, task_finished, task_started
 from django.utils import timezone
+
+
+class AcknowledgeableTaskBackend(BaseTaskBackend, ABC):
+    """Provide an interface for tasks queues to be processed by the executor."""
+
+    def acquire(self, queues: str, timeout=datetime.timedelta) -> TaskResult:
+        """Return and lock the next task to be processed without removing it from the queue."""
+        raise NotImplementedError
+
+    def acknowledge(self, task_result: TaskResult):
+        """Remove the task from the queue and publish the result."""
+        raise NotImplementedError
 
 
 class WorkerProcess(Process):
@@ -45,8 +60,7 @@ class TaskExecutor:
     def __init__(
         self,
         *,
-        backend: list[str] | str | None = None,
-        queue: Queue[TaskResult],
+        backend: AcknowledgeableTaskBackend,
         workers: int | None = None,
         threads: int = 1,
         max_tasks: int = 0,
@@ -54,8 +68,7 @@ class TaskExecutor:
         get_timeout_secs: float = 1.0,
     ) -> None:
         """Create pool-backed executor with queue consumption settings."""
-        del backend
-        self.task_queue = queue
+        self.backend = backend
         self.process_count = workers or max(multiprocessing.cpu_count() - 1, 1)
         self.thread_count = threads
         self.max_tasks = max_tasks
@@ -92,14 +105,14 @@ class TaskExecutor:
         while self.is_running:
             self._replace_dead_worker_processes()
             try:
-                task_result = self.task_queue.get(timeout=self.get_timeout_secs)
+                task_result = self.backend.acquire(timeout=self.get_timeout_secs)
             except (Empty, ShutDown):
                 continue
             try:
                 # Block when all worker threads are saturated.
                 self.shared_task_queue.put(task_result)
             finally:
-                self.task_queue.task_done()
+                self.backend.acknowledge(task_result)
 
     def shutdown(self) -> None:
         """Stop queue consumption and terminate all worker processes."""
