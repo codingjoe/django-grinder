@@ -2,6 +2,7 @@ import signal
 import sys
 
 from django.core.management import BaseCommand
+from django.tasks import task_backends
 
 from ... import Executor
 
@@ -19,27 +20,31 @@ class Command(BaseCommand):
 
     def add_arguments(self, parser):
         parser.add_argument(
-            "-b", "--backends",
+            "-b",
+            "--backends",
             nargs="+",
             default="default",
             help="Alias of the tasks backend to use.",
         )
         parser.add_argument(
-            "-q", "--queues",
+            "-q",
+            "--queues",
             nargs="+",
             default="default",
             help="Queue names to listen too and process tasks from.",
         )
         parser.add_argument(
-            "-w", "--workers",
+            "-w",
+            "--workers",
             type=int,
             help="Number of worker processes to use. Defaults to the number of CPU cores minus one.",
         )
         parser.add_argument(
-            "-t", "--threads",
+            "-t",
+            "--threads",
             type=int,
             default=1,
-            help="Number of threads to use. Defaults to the number of CPU cores minus one. "
+            help="Number of threads to use. Defaults to the number of CPU cores minus one. ",
         )
         parser.add_argument(
             "--max-tasks",
@@ -56,8 +61,26 @@ class Command(BaseCommand):
             default=0,
             help="Maximum random jitter to add to the max-tasks value by randint(0, max_tasks_jitter).",
         )
+        parser.add_argument(
+            "--task-timeout",
+            type=float,
+            default=3600.0,
+            help="Kill hung tasks after timeout seconds. Defaults to one hour.",
+        )
 
-    def handle(self, *, verbosity, backends, queues, workers, threads, max_tasks, max_tasks_jitter, **options):
+    def handle(
+        self,
+        *,
+        verbosity,
+        backends,
+        queues,
+        workers,
+        threads,
+        max_tasks,
+        max_tasks_jitter,
+        task_timeout,
+        **options,
+    ):
         match sys.platform:
             case "win32":
                 signal.signal(signal.SIGBREAK, kill_softly)
@@ -66,13 +89,15 @@ class Command(BaseCommand):
         signal.signal(signal.SIGTERM, kill_softly)
         signal.signal(signal.SIGINT, kill_softly)
         self.stdout.write(self.style.SUCCESS("Starting worker…"))
+        backend_alias = backends[0] if isinstance(backends, list) else backends
+        backend = task_backends[backend_alias]
         exe = Executor(
-            backend=backends,
-            queue=queues,
+            backend=backend,
             workers=workers,
             threads=threads,
             max_tasks=max_tasks,
             max_tasks_jitter=max_tasks_jitter,
+            task_timeout=task_timeout,
         )
         try:
             exe.run()
