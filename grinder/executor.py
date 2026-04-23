@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import datetime
 import multiprocessing
@@ -15,11 +16,7 @@ from queue import Empty
 from traceback import format_exception
 
 from django.tasks import TaskResult
-from django.tasks.base import (
-    TaskContext,
-    TaskError,
-    TaskResultStatus,
-)
+from django.tasks.base import TaskContext, TaskError, TaskResultStatus
 from django.tasks.signals import task_enqueued, task_finished, task_started
 from django.utils import timezone
 from django.utils.json import normalize_json
@@ -28,7 +25,7 @@ if typing.TYPE_CHECKING:
     from .backends import AcknowledgeableTaskBackend
 
 
-class WorkerProcess(Process):
+class WorkerProcess(multiprocessing.Process):
     """Single worker process running thread_count consumer threads."""
 
     def __init__(
@@ -61,47 +58,45 @@ class WorkerProcess(Process):
         self.join()
 
 
+@dataclasses.dataclass(kw_only=True, slots=True)
 class TaskExecutor:
     """Consume tasks from a priority queue with process and thread pools."""
 
-    def __init__(
-        self,
-        *,
-        backend: AcknowledgeableTaskBackend,
-        workers: int | None = None,
-        threads: int = 1,
-        max_tasks: int = 0,
-        max_tasks_jitter: int = 0,
-        task_timeout: datetime.timedelta = datetime.timedelta(hours=1),
-    ) -> None:
-        """Create pool-backed executor with queue consumption settings."""
-        self.is_publishing = True
-        self.backend = backend
-        self.process_count = workers or max(multiprocessing.cpu_count() - 1, 1)
-        self.thread_count = threads
-        self.max_tasks = max_tasks
-        self.max_tasks_jitter = max_tasks_jitter
-        self.task_timeout = task_timeout
-        self.is_acquiring = True
-        self._worker_processes: list[WorkerProcess] = []
-        self.worker_shutdown_deadline_at_secs_by_process_id: dict[int, float] = {}
-        self.processing_slot_count = self.process_count * self.thread_count
-        self.shared_task_queue: multiprocessing.JoinableQueue[TaskResult] = (
-            multiprocessing.JoinableQueue(
-                maxsize=self.processing_slot_count,
-            )
+    backend: AcknowledgeableTaskBackend
+    workers: int | None = None
+    threads: int = 1
+    max_tasks: int = 0
+    max_tasks_jitter: int = 0
+    task_timeout: datetime.timedelta = datetime.timedelta(hours=1)
+    acquire_timeout: datetime.timedelta = datetime.timedelta(seconds=1)
+    is_acquiring: bool = dataclasses.field(default=True, init=False)
+    is_publishing: bool = dataclasses.field(default=True, init=False)
+    _worker_processes: list[WorkerProcess] = dataclasses.field(
+        default_factory=list, init=False
+    )
+    process_count: int = dataclasses.field(init=False)
+    thread_count: int = dataclasses.field(init=False)
+    shared_task_queue: multiprocessing.JoinableQueue[TaskResult] = dataclasses.field(
+        init=False
+    )
+    processed_task_queue: multiprocessing.JoinableQueue[TaskResult] = dataclasses.field(
+        init=False
+    )
+
+    def __post_init__(self) -> None:
+        """Initialize derived orchestration fields and queues."""
+        self.process_count = self.workers or max(multiprocessing.cpu_count() - 1, 1)
+        self.thread_count = max(self.threads, 1)
+        self.shared_task_queue = multiprocessing.JoinableQueue(
+            maxsize=self.process_count * self.thread_count,
         )
-        self.processed_task_queue: multiprocessing.JoinableQueue[TaskResult] = (
-            multiprocessing.JoinableQueue(
-                maxsize=self.processing_slot_count,
-            )
-        )
+        self.processed_task_queue = multiprocessing.JoinableQueue()
 
     def _get_maximum_tasks_per_child(self) -> int | None:
         """Return worker recycling limit based on config and thread count."""
         if self.max_tasks:
             return (
-                self.max_tasks + random.randint(0, self.max_tasks_jitter)
+                self.max_tasks + random.randint(0, self.max_tasks_jitter)  # noqa: S311
             ) // self.thread_count
         return None
 
@@ -122,15 +117,18 @@ class TaskExecutor:
         self._worker_processes = [
             self._create_worker_process() for _ in range(self.process_count)
         ]
-        while self.is_acquiring:
-            self._replace_dead_worker_processes()
+        asyncio.gather(
+            asyncio.create_task(self.acquire_tasks()),
+            asyncio.create_task(self.acknowledge_tasks()),
+            asyncio.create_task(self.maintain_worker_pool()),
+        )
 
-    async def buffer_tasks(self) -> None:
+    async def acquire_tasks(self) -> None:
         """Buffer tasks in shared task queue."""
         while self.is_acquiring:
             self.shared_task_queue.put(self.backend.acquire())
 
-    async def _drain_processed_tasks(self) -> None:
+    async def acknowledge_tasks(self) -> None:
         """Acknowledge processed tasks and publish updated results in main process."""
         while self.is_publishing:
             self.backend.acknowledge(self.processed_task_queue.get(block=True))
@@ -145,18 +143,14 @@ class TaskExecutor:
         self.processed_task_queue.join()
         self.is_publishing = False
 
-    def _replace_dead_worker_processes(self) -> None:
+    async def maintain_worker_pool(self) -> None:
         """Restart worker processes that have exited."""
-        for index, worker in enumerate(self._worker_processes):
-            if worker.is_alive():
-                continue
-            process_id = worker.pid
-            worker.join(timeout=0)
-            if process_id is not None:
-                self.worker_shutdown_deadline_at_secs_by_process_id.pop(
-                    process_id, None
-                )
-            self._worker_processes[index] = self._create_worker_process()
+        while self.is_publishing:
+            for index, worker in enumerate(self._worker_processes):
+                if worker.is_alive():
+                    continue
+                worker.join(timeout=0)
+                self._worker_processes[index] = self._create_worker_process()
 
 
 def _run_worker_process(
