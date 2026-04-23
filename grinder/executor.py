@@ -6,7 +6,6 @@ import asyncio
 import dataclasses
 import datetime
 import multiprocessing
-import os
 import random
 import socket
 import threading
@@ -188,37 +187,34 @@ class WorkerThread(threading.Thread):
         index: int,
     ) -> None:
         """Create worker thread bound to process worker state."""
-        super().__init__(name=f"task-consumer-thread-{index}")
+        super().__init__(name=f"{socket.gethostname()}:{worker.pid}-{index}")
         self.worker = worker
 
     def run(self) -> None:
         """Start consuming tasks for this thread."""
-        self.consume_tasks(self.worker)
-
-    @staticmethod
-    def consume_tasks(worker: WorkerProcess) -> None:
-        """Consume and execute tasks from shared task queue."""
-        while worker.expired is None or not worker.expired.is_set():
-            if worker.shutdown_requested.is_set() and worker.task_queue.empty():
+        while self.worker.expired is None or not self.worker.expired.is_set():
+            if (
+                self.worker.shutdown_requested.is_set()
+                and self.worker.task_queue.empty()
+            ):
                 return
             try:
-                task_result = worker.task_queue.get(timeout=1.0)
+                task_result = self.worker.task_queue.get(timeout=1.0)
             except Empty:
-                if worker.shutdown_requested.is_set():
+                if self.worker.shutdown_requested.is_set():
                     return
                 continue
             try:
-                worker.processed_task_queue.put(
-                    WorkerThread.execute_task_result(
+                self.worker.processed_task_queue.put(
+                    self.execute_task_result(
                         task_result,
                     )
                 )
             finally:
-                worker.task_queue.task_done()
-                worker.record_task()
+                self.worker.task_queue.task_done()
+                self.worker.record_task()
 
-    @staticmethod
-    def execute_task_result(task_result: TaskResult) -> TaskResult:
+    def execute_task_result(self, task_result: TaskResult) -> TaskResult:
         """Execute task from task result and update result lifecycle state."""
         started_at = timezone.now()
         task_result = dataclasses.replace(
@@ -226,7 +222,7 @@ class WorkerThread(threading.Thread):
             status=TaskResultStatus.RUNNING,
             started_at=started_at,
             last_attempted_at=started_at,
-            worker_ids=[*task_result.worker_ids, WorkerThread.create_worker_id()],
+            worker_ids=[*task_result.worker_ids, self.name],
         )
         task_enqueued.send(TaskExecutor, task_result=task_result)
         task_started.send(TaskExecutor, task_result=task_result)
@@ -255,11 +251,6 @@ class WorkerThread(threading.Thread):
             task_finished.send(TaskExecutor, task_result=task_result)
 
         return task_result
-
-    @staticmethod
-    def create_worker_id() -> str:
-        """Create worker id in host-process-thread format."""
-        return f"{socket.gethostname()}:{os.getpid()}:{threading.get_ident()}"
 
     @staticmethod
     def call_task(task_result: TaskResult) -> typing.Any:
