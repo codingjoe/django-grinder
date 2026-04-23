@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
+import dataclasses
 import multiprocessing
 import random
 import threading
 import typing
-import dataclasses
 from multiprocessing import JoinableQueue, Process
-from queue import Empty, ShutDown
+from queue import Empty, Full, ShutDown
 from traceback import format_exception
 
 from django.tasks import TaskResult
@@ -77,7 +77,9 @@ class TaskExecutor:
     def _get_maximum_tasks_per_child(self) -> int | None:
         """Return worker recycling limit based on config and thread count."""
         if self.max_tasks:
-            return (self.max_tasks + random.randint(0, self.max_tasks_jitter)) // self.thread_count
+            return (
+                self.max_tasks + random.randint(0, self.max_tasks_jitter)
+            ) // self.thread_count
         return None
 
     def _create_worker_process(self) -> WorkerProcess:
@@ -103,13 +105,17 @@ class TaskExecutor:
                 task_result = self.backend.acquire(timeout=self.get_timeout_secs)
             except (Empty, ShutDown):
                 continue
-            try:
-                # Block when all worker threads are saturated.
-                self.shared_task_queue.put(task_result)
+            self._put_task_with_healing(task_result)
 
-            except Exception:
-                # Preserve old behavior of surfacing dispatch errors.
-                raise
+    def _put_task_with_healing(self, task_result: TaskResult) -> None:
+        """Put task into shared queue while continuously healing crashed workers."""
+        while self.is_running:
+            self._replace_dead_worker_processes()
+            try:
+                self.shared_task_queue.put(task_result, timeout=self.get_timeout_secs)
+                return
+            except Full:
+                continue
 
     def _drain_processed_tasks(self) -> None:
         """Acknowledge processed tasks and publish updated results in main process."""
@@ -135,6 +141,7 @@ class TaskExecutor:
         for index, worker in enumerate(self._worker_processes):
             if worker.is_alive():
                 continue
+            worker.join(timeout=0)
             self._worker_processes[index] = self._create_worker_process()
 
 
@@ -236,7 +243,6 @@ def _execute_task_result(task_result: TaskResult) -> TaskResult:
 
     task_finished.send(TaskExecutor, task_result=task_result)
     return task_result
-
 
 
 def _call_task(task_result: TaskResult) -> typing.Any:
