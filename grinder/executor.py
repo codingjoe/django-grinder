@@ -38,7 +38,7 @@ class TaskExecutor:
     acquire_timeout: datetime.timedelta = datetime.timedelta(seconds=1)
     is_acquiring: bool = dataclasses.field(default=True, init=False)
     is_publishing: bool = dataclasses.field(default=True, init=False)
-    _worker_processes: list[WorkerProcess] = dataclasses.field(
+    worker_processes: list[WorkerProcess] = dataclasses.field(
         default_factory=list, init=False
     )
     process_count: int = dataclasses.field(init=False)
@@ -59,7 +59,7 @@ class TaskExecutor:
         )
         self.processed_task_queue = multiprocessing.JoinableQueue()
 
-    def _get_maximum_tasks_per_child(self) -> int | None:
+    def get_maximum_tasks_per_child(self) -> int | None:
         """Return worker recycling limit based on config and thread count."""
         if self.max_tasks:
             return (
@@ -67,22 +67,22 @@ class TaskExecutor:
             ) // self.thread_count
         return None
 
-    def _create_worker_process(self) -> WorkerProcess:
+    def create_worker_process(self) -> WorkerProcess:
         """Create and start a new worker process."""
         worker = WorkerProcess(
             self.shared_task_queue,
             self.processed_task_queue,
             self.thread_count,
             self.task_timeout,
-            self._get_maximum_tasks_per_child(),
+            self.get_maximum_tasks_per_child(),
         )
         worker.start()
         return worker
 
     def run(self) -> None:
         """Start consuming tasks until shutdown is requested."""
-        self._worker_processes = [
-            self._create_worker_process() for _ in range(self.process_count)
+        self.worker_processes = [
+            self.create_worker_process() for _ in range(self.process_count)
         ]
         asyncio.gather(
             asyncio.create_task(self.acquire_tasks()),
@@ -105,7 +105,7 @@ class TaskExecutor:
         """Stop queue consumption and terminate all worker processes."""
         self.is_acquiring = False
         self.shared_task_queue.join()
-        for worker in self._worker_processes:
+        for worker in self.worker_processes:
             worker.shutdown()
         self.processed_task_queue.join()
         self.is_publishing = False
@@ -113,11 +113,11 @@ class TaskExecutor:
     async def maintain_worker_pool(self) -> None:
         """Restart worker processes that have exited."""
         while self.is_publishing:
-            for index, worker in enumerate(self._worker_processes):
+            for index, worker in enumerate(self.worker_processes):
                 if worker.is_alive():
                     continue
                 worker.join(timeout=0)
-                self._worker_processes[index] = self._create_worker_process()
+                self.worker_processes[index] = self.create_worker_process()
 
 
 class WorkerProcess(multiprocessing.Process):
@@ -133,19 +133,44 @@ class WorkerProcess(multiprocessing.Process):
     ) -> None:
         """Create process with dedicated thread pool for task execution."""
         self.shutdown_requested = multiprocessing.Event()
-        super().__init__(
-            target=_run_worker_process,
-            args=(
-                task_queue,
-                processed_task_queue,
-                thread_count,
-                task_timeout,
-                max_tasks,
-                self.shutdown_requested,
-            ),
-            daemon=True,
-        )
+        super().__init__(daemon=True)
+        self.task_queue = task_queue
+        self.processed_task_queue = processed_task_queue
         self.thread_count = thread_count
+        self.task_timeout = task_timeout
+        self.max_tasks = max_tasks
+        self.task_count = 0
+        self.lock: threading.Lock | None = None
+        self.expired: threading.Event | None = None
+
+    def run(self) -> None:
+        """Start consumer execution inside this process."""
+        self.lock = threading.Lock()
+        self.expired = threading.Event()
+        self.run_worker_process(self)
+
+    @staticmethod
+    def run_worker_process(worker: WorkerProcess) -> None:
+        """Run consumer threads in a process that read from shared task queue."""
+        consumer_threads = [
+            WorkerThread(worker=worker, index=index)
+            for index in range(worker.thread_count)
+        ]
+        for consumer_thread in consumer_threads:
+            consumer_thread.start()
+        for consumer_thread in consumer_threads:
+            consumer_thread.join(worker.task_timeout.total_seconds())
+
+    def record_task(self) -> None:
+        """Record one processed task and stop when max_tasks is reached."""
+        if self.max_tasks is None:
+            return
+        if self.lock is None or self.expired is None:
+            return
+        with self.lock:
+            self.task_count += 1
+            if self.task_count >= self.max_tasks:
+                self.expired.set()
 
     def shutdown(self) -> None:
         """Request graceful worker stop and wait for process exit."""
@@ -153,144 +178,106 @@ class WorkerProcess(multiprocessing.Process):
         self.join()
 
 
-class _WorkerState:
-    """State shared by process-local consumer threads."""
+class WorkerThread(threading.Thread):
+    """Single worker thread consuming tasks from the process queue."""
 
     def __init__(
         self,
-        max_tasks: int | None,
-        task_timeout: datetime.timedelta,
+        *,
+        worker: WorkerProcess,
+        index: int,
     ) -> None:
-        """Create process-local execution state."""
-        self.max_tasks = max_tasks
-        self.task_timeout = task_timeout
-        self.task_count = 0
-        self.lock = threading.Lock()
-        self.expired = threading.Event()
+        """Create worker thread bound to process worker state."""
+        super().__init__(name=f"task-consumer-thread-{index}")
+        self.worker = worker
 
-    def record_task(self) -> None:
-        """Record one processed task and stop when max_tasks is reached."""
-        if self.max_tasks is None:
-            return
-        with self.lock:
-            self.task_count += 1
-            if self.task_count >= self.max_tasks:
-                self.expired.set()
+    def run(self) -> None:
+        """Start consuming tasks for this thread."""
+        self.consume_tasks(self.worker)
 
-
-def _run_worker_process(
-    task_queue: multiprocessing.JoinableQueue[TaskResult],
-    processed_task_queue: multiprocessing.JoinableQueue[TaskResult],
-    thread_count: int,
-    task_timeout: datetime.timedelta,
-    max_tasks: int | None,
-) -> None:
-    """Run consumer threads in a process that read from shared task queue."""
-    state = _WorkerState(
-        max_tasks=max_tasks,
-        task_timeout=task_timeout,
-    )
-    if thread_count == 1:
-        _consume_tasks(task_queue, processed_task_queue, state)
-        return
-    consumer_threads = [
-        threading.Thread(
-            target=_consume_tasks,
-            args=(task_queue, processed_task_queue, state),
-            name=f"task-consumer-thread-{index}",
-        )
-        for index in range(thread_count)
-    ]
-    for consumer_thread in consumer_threads:
-        consumer_thread.start()
-    for consumer_thread in consumer_threads:
-        # Wait for consumer thread to finish or timeout.
-        consumer_thread.join(task_timeout.total_seconds())
-
-
-def _consume_tasks(
-    task_queue: multiprocessing.JoinableQueue[TaskResult],
-    processed_task_queue: multiprocessing.JoinableQueue[TaskResult],
-    state: _WorkerState,
-) -> None:
-    """Consume and execute tasks from shared task queue."""
-    while not state.expired.is_set():
-        try:
-            task_result = task_queue.get(timeout=1.0)
-        except Empty:
-            continue
-        try:
-            processed_task_queue.put(
-                _execute_task_result(
-                    task_result,
+    @staticmethod
+    def consume_tasks(worker: WorkerProcess) -> None:
+        """Consume and execute tasks from shared task queue."""
+        while worker.expired is None or not worker.expired.is_set():
+            if worker.shutdown_requested.is_set() and worker.task_queue.empty():
+                return
+            try:
+                task_result = worker.task_queue.get(timeout=1.0)
+            except Empty:
+                if worker.shutdown_requested.is_set():
+                    return
+                continue
+            try:
+                worker.processed_task_queue.put(
+                    WorkerThread.execute_task_result(
+                        task_result,
+                    )
                 )
+            finally:
+                worker.task_queue.task_done()
+                worker.record_task()
+
+    @staticmethod
+    def execute_task_result(task_result: TaskResult) -> TaskResult:
+        """Execute task from task result and update result lifecycle state."""
+        started_at = timezone.now()
+        task_result = dataclasses.replace(
+            task_result,
+            status=TaskResultStatus.RUNNING,
+            started_at=started_at,
+            last_attempted_at=started_at,
+            worker_ids=[*task_result.worker_ids, WorkerThread.create_worker_id()],
+        )
+        task_enqueued.send(TaskExecutor, task_result=task_result)
+        task_started.send(TaskExecutor, task_result=task_result)
+
+        try:
+            return_value = WorkerThread.call_task(task_result)
+        except Exception as exception:
+            task_result = dataclasses.replace(
+                task_result,
+                status=TaskResultStatus.FAILED,
+                errors=[*task_result.errors, WorkerThread.create_task_error(exception)],
+            )
+        else:
+            task_result = dataclasses.replace(
+                task_result,
+                status=TaskResultStatus.SUCCESSFUL,
+            )
+            object.__setattr__(
+                task_result, "_return_value", normalize_json(return_value)
             )
         finally:
-            task_queue.task_done()
-            state.record_task()
+            task_result = dataclasses.replace(
+                task_result,
+                finished_at=timezone.now(),
+            )
+            task_finished.send(TaskExecutor, task_result=task_result)
 
+        return task_result
 
-def _execute_task_result(
-    task_result: TaskResult,
-) -> TaskResult:
-    """Execute task from task result and update result lifecycle state."""
-    started_at = timezone.now()
-    task_result = dataclasses.replace(
-        task_result,
-        status=TaskResultStatus.RUNNING,
-        started_at=started_at,
-        last_attempted_at=started_at,
-        worker_ids=[*task_result.worker_ids, _create_worker_id()],
-    )
-    task_enqueued.send(TaskExecutor, task_result=task_result)
-    task_started.send(TaskExecutor, task_result=task_result)
+    @staticmethod
+    def create_worker_id() -> str:
+        """Create worker id in host-process-thread format."""
+        return f"{socket.gethostname()}:{os.getpid()}:{threading.get_ident()}"
 
-    try:
-        return_value = _call_task(task_result)
-    except Exception as exception:
-        task_result = dataclasses.replace(
-            task_result,
-            status=TaskResultStatus.FAILED,
-            errors=[*task_result.errors, _create_task_error(exception)],
-        )
-    else:
-        task_result = dataclasses.replace(
-            task_result,
-            status=TaskResultStatus.SUCCESSFUL,
-            _return_value=normalize_json(return_value),
-        )
-    finally:
-        task_result = dataclasses.replace(
-            task_result,
-            finished_at=timezone.now(),
-        )
-        task_finished.send(TaskExecutor, task_result=task_result)
-
-    return task_result
-
-
-def _create_worker_id() -> str:
-    """Create worker id in host-process-thread format."""
-    return f"{socket.gethostname()}:{os.getpid()}:{threading.get_ident()}"
-
-
-def _call_task(task_result: TaskResult) -> typing.Any:
-    """Call a task with context when required."""
-    task = task_result.task
-    if task.takes_context:
-        return task.call(
-            TaskContext(task_result=task_result),
-            *task_result.args,
-            **task_result.kwargs,
-        )
-    else:
+    @staticmethod
+    def call_task(task_result: TaskResult) -> typing.Any:
+        """Call a task with context when required."""
+        task = task_result.task
+        if task.takes_context:
+            return task.call(
+                TaskContext(task_result=task_result),
+                *task_result.args,
+                **task_result.kwargs,
+            )
         return task.call(*task_result.args, **task_result.kwargs)
 
-
-def _create_task_error(exception: BaseException) -> TaskError:
-    """Build a task error payload for failed execution."""
-    exception_type = type(exception)
-    return TaskError(
-        exception_class_path=f"{exception_type.__module__}.{exception_type.__qualname__}",
-        traceback="".join(format_exception(exception)),
-    )
+    @staticmethod
+    def create_task_error(exception: BaseException) -> TaskError:
+        """Build a task error payload for failed execution."""
+        exception_type = type(exception)
+        return TaskError(
+            exception_class_path=f"{exception_type.__module__}.{exception_type.__qualname__}",
+            traceback="".join(format_exception(exception)),
+        )
