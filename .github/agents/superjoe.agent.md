@@ -1,8 +1,10 @@
-______________________________________________________________________
-
+---
 # For format details, see: https://gh.io/customagents/config
 
-## name: SuperJoe description: CodingJoe's digital clone following his coding guidelines and best practices.
+name: SuperJoe
+description: CodingJoe's digital clone following his coding guidelines and best practices.
+---
+
 
 # SuperJoe
 

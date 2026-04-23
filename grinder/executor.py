@@ -2,13 +2,12 @@
 
 from __future__ import annotations
 
-import datetime
 import multiprocessing
 import random
 import threading
 from abc import ABC
 from multiprocessing import JoinableQueue, Process
-from queue import Empty, Queue, ShutDown
+from queue import Empty, ShutDown
 from traceback import format_exception
 from typing import Any
 
@@ -22,11 +21,11 @@ from django.utils import timezone
 class AcknowledgeableTaskBackend(BaseTaskBackend, ABC):
     """Provide an interface for tasks queues to be processed by the executor."""
 
-    def acquire(self, queues: str, timeout=datetime.timedelta) -> TaskResult:
+    def acquire(self, timeout: float) -> TaskResult:
         """Return and lock the next task to be processed without removing it from the queue."""
         raise NotImplementedError
 
-    def acknowledge(self, task_result: TaskResult):
+    def acknowledge(self, task_result: TaskResult) -> None:
         """Remove the task from the queue and publish the result."""
         raise NotImplementedError
 
@@ -37,13 +36,14 @@ class WorkerProcess(Process):
     def __init__(
         self,
         task_queue: JoinableQueue[TaskResult],
+        processed_task_queue: JoinableQueue[TaskResult],
         thread_count: int,
         max_tasks: int | None = None,
     ) -> None:
         """Create process with dedicated thread pool for task execution."""
         super().__init__(
             target=_run_worker_process,
-            args=(task_queue, thread_count, max_tasks),
+            args=(task_queue, processed_task_queue, thread_count, max_tasks),
             daemon=True,
         )
         self.thread_count = thread_count
@@ -80,6 +80,9 @@ class TaskExecutor:
         self.shared_task_queue: JoinableQueue[TaskResult] = JoinableQueue(
             maxsize=self.processing_slot_count,
         )
+        self.processed_task_queue: JoinableQueue[TaskResult] = JoinableQueue(
+            maxsize=self.processing_slot_count,
+        )
 
     def _get_maximum_tasks_per_child(self) -> int | None:
         """Return worker recycling limit based on config and thread count."""
@@ -91,6 +94,7 @@ class TaskExecutor:
         """Create and start a new worker process."""
         worker = WorkerProcess(
             self.shared_task_queue,
+            self.processed_task_queue,
             self.thread_count,
             self._get_maximum_tasks_per_child(),
         )
@@ -104,6 +108,7 @@ class TaskExecutor:
         ]
         while self.is_running:
             self._replace_dead_worker_processes()
+            self._drain_processed_tasks()
             try:
                 task_result = self.backend.acquire(timeout=self.get_timeout_secs)
             except (Empty, ShutDown):
@@ -111,14 +116,29 @@ class TaskExecutor:
             try:
                 # Block when all worker threads are saturated.
                 self.shared_task_queue.put(task_result)
-            finally:
+
+            except Exception:
+                # Preserve old behavior of surfacing dispatch errors.
+                raise
+
+    def _drain_processed_tasks(self) -> None:
+        """Acknowledge processed tasks and publish updated results in main process."""
+        while True:
+            try:
+                task_result = self.processed_task_queue.get_nowait()
+            except Empty:
+                return
+            try:
                 self.backend.acknowledge(task_result)
+            finally:
+                self.processed_task_queue.task_done()
 
     def shutdown(self) -> None:
         """Stop queue consumption and terminate all worker processes."""
         self.is_running = False
         for worker in self._worker_processes:
             worker.shutdown()
+        self._drain_processed_tasks()
 
     def _replace_dead_worker_processes(self) -> None:
         """Restart worker processes that have exited."""
@@ -130,18 +150,19 @@ class TaskExecutor:
 
 def _run_worker_process(
     task_queue: JoinableQueue[TaskResult],
+    processed_task_queue: JoinableQueue[TaskResult],
     thread_count: int,
     max_tasks: int | None,
 ) -> None:
     """Run consumer threads in a process that read from shared task queue."""
     state = _WorkerState(max_tasks=max_tasks)
     if thread_count == 1:
-        _consume_tasks(task_queue, state)
+        _consume_tasks(task_queue, processed_task_queue, state)
         return
     consumer_threads = [
         threading.Thread(
             target=_consume_tasks,
-            args=(task_queue, state),
+            args=(task_queue, processed_task_queue, state),
             name=f"task-consumer-thread-{index}",
         )
         for index in range(thread_count)
@@ -174,6 +195,7 @@ class _WorkerState:
 
 def _consume_tasks(
     task_queue: JoinableQueue[TaskResult],
+    processed_task_queue: JoinableQueue[TaskResult],
     state: _WorkerState,
 ) -> None:
     """Consume and execute tasks from shared task queue."""
@@ -183,7 +205,8 @@ def _consume_tasks(
         except Empty:
             continue
         try:
-            _execute_task_result(task_result)
+            processed_task_result = _execute_task_result(task_result)
+            processed_task_queue.put(processed_task_result)
         finally:
             task_queue.task_done()
             state.record_task()
