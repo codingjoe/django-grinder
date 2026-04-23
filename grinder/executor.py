@@ -25,39 +25,6 @@ if typing.TYPE_CHECKING:
     from .backends import AcknowledgeableTaskBackend
 
 
-class WorkerProcess(multiprocessing.Process):
-    """Single worker process running thread_count consumer threads."""
-
-    def __init__(
-        self,
-        task_queue: JoinableQueue[TaskResult],
-        processed_task_queue: JoinableQueue[TaskResult],
-        thread_count: int,
-        task_timeout: datetime.timedelta,
-        max_tasks: int | None = None,
-    ) -> None:
-        """Create process with dedicated thread pool for task execution."""
-        self.shutdown_requested = multiprocessing.Event()
-        super().__init__(
-            target=_run_worker_process,
-            args=(
-                task_queue,
-                processed_task_queue,
-                thread_count,
-                task_timeout,
-                max_tasks,
-                self.shutdown_requested,
-            ),
-            daemon=True,
-        )
-        self.thread_count = thread_count
-
-    def shutdown(self) -> None:
-        """Request graceful worker stop and wait for process exit."""
-        self.shutdown_requested.set()
-        self.join()
-
-
 @dataclasses.dataclass(kw_only=True, slots=True)
 class TaskExecutor:
     """Consume tasks from a priority queue with process and thread pools."""
@@ -153,6 +120,64 @@ class TaskExecutor:
                 self._worker_processes[index] = self._create_worker_process()
 
 
+class WorkerProcess(multiprocessing.Process):
+    """Single worker process running thread_count consumer threads."""
+
+    def __init__(
+        self,
+        task_queue: JoinableQueue[TaskResult],
+        processed_task_queue: JoinableQueue[TaskResult],
+        thread_count: int,
+        task_timeout: datetime.timedelta,
+        max_tasks: int | None = None,
+    ) -> None:
+        """Create process with dedicated thread pool for task execution."""
+        self.shutdown_requested = multiprocessing.Event()
+        super().__init__(
+            target=_run_worker_process,
+            args=(
+                task_queue,
+                processed_task_queue,
+                thread_count,
+                task_timeout,
+                max_tasks,
+                self.shutdown_requested,
+            ),
+            daemon=True,
+        )
+        self.thread_count = thread_count
+
+    def shutdown(self) -> None:
+        """Request graceful worker stop and wait for process exit."""
+        self.shutdown_requested.set()
+        self.join()
+
+
+class _WorkerState:
+    """State shared by process-local consumer threads."""
+
+    def __init__(
+        self,
+        max_tasks: int | None,
+        task_timeout: datetime.timedelta,
+    ) -> None:
+        """Create process-local execution state."""
+        self.max_tasks = max_tasks
+        self.task_timeout = task_timeout
+        self.task_count = 0
+        self.lock = threading.Lock()
+        self.expired = threading.Event()
+
+    def record_task(self) -> None:
+        """Record one processed task and stop when max_tasks is reached."""
+        if self.max_tasks is None:
+            return
+        with self.lock:
+            self.task_count += 1
+            if self.task_count >= self.max_tasks:
+                self.expired.set()
+
+
 def _run_worker_process(
     task_queue: multiprocessing.JoinableQueue[TaskResult],
     processed_task_queue: multiprocessing.JoinableQueue[TaskResult],
@@ -181,31 +206,6 @@ def _run_worker_process(
     for consumer_thread in consumer_threads:
         # Wait for consumer thread to finish or timeout.
         consumer_thread.join(task_timeout.total_seconds())
-
-
-class _WorkerState:
-    """State shared by process-local consumer threads."""
-
-    def __init__(
-        self,
-        max_tasks: int | None,
-        task_timeout: datetime.timedelta,
-    ) -> None:
-        """Create process-local execution state."""
-        self.max_tasks = max_tasks
-        self.task_timeout = task_timeout
-        self.task_count = 0
-        self.lock = threading.Lock()
-        self.expired = threading.Event()
-
-    def record_task(self) -> None:
-        """Record one processed task and stop when max_tasks is reached."""
-        if self.max_tasks is None:
-            return
-        with self.lock:
-            self.task_count += 1
-            if self.task_count >= self.max_tasks:
-                self.expired.set()
 
 
 def _consume_tasks(
