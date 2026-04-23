@@ -1,0 +1,18 @@
+from __future__ import annotations
+
+from abc import ABC
+
+from django.tasks import TaskResult
+from django.tasks.backends.base import BaseTaskBackend
+
+
+class AcknowledgeableTaskBackend(BaseTaskBackend, ABC):
+    """Provide an interface for tasks queues to be processed by the executor."""
+
+    def acquire(self, timeout: float) -> TaskResult:
+        """Return and lock the next task to be processed without removing it from the queue."""
+        raise NotImplementedError
+
+    def acknowledge(self, task_result: TaskResult) -> None:
+        """Remove the task from the queue and publish the result."""
+        raise NotImplementedError

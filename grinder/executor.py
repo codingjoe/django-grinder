@@ -5,29 +5,19 @@ from __future__ import annotations
 import multiprocessing
 import random
 import threading
-from abc import ABC
+import typing
+import dataclasses
 from multiprocessing import JoinableQueue, Process
 from queue import Empty, ShutDown
 from traceback import format_exception
-from typing import Any
 
 from django.tasks import TaskResult
-from django.tasks.backends.base import BaseTaskBackend
-from django.tasks.base import TaskContext, TaskError, TaskResultStatus, normalize_json
+from django.tasks.base import TaskContext, TaskError, TaskResultStatus
 from django.tasks.signals import task_enqueued, task_finished, task_started
 from django.utils import timezone
 
-
-class AcknowledgeableTaskBackend(BaseTaskBackend, ABC):
-    """Provide an interface for tasks queues to be processed by the executor."""
-
-    def acquire(self, timeout: float) -> TaskResult:
-        """Return and lock the next task to be processed without removing it from the queue."""
-        raise NotImplementedError
-
-    def acknowledge(self, task_result: TaskResult) -> None:
-        """Remove the task from the queue and publish the result."""
-        raise NotImplementedError
+if typing.TYPE_CHECKING:
+    from .backends import AcknowledgeableTaskBackend
 
 
 class WorkerProcess(Process):
@@ -214,36 +204,43 @@ def _consume_tasks(
 
 def _execute_task_result(task_result: TaskResult) -> TaskResult:
     """Execute task from task result and update result lifecycle state."""
-    enqueued_at = timezone.now()
-    object.__setattr__(task_result, "enqueued_at", enqueued_at)
+    task_result = dataclasses.replace(task_result, enqueued_at=timezone.now())
     task_enqueued.send(TaskExecutor, task_result=task_result)
 
     started_at = timezone.now()
-    object.__setattr__(task_result, "status", TaskResultStatus.RUNNING)
-    object.__setattr__(task_result, "started_at", started_at)
-    object.__setattr__(task_result, "last_attempted_at", started_at)
+    task_result = dataclasses.replace(
+        task_result,
+        status=TaskResultStatus.RUNNING,
+        started_at=started_at,
+        last_attempted_at=started_at,
+    )
     task_started.send(TaskExecutor, task_result=task_result)
 
     try:
-        raw_return_value = _call_task(task_result)
+        _call_task(task_result)
     except KeyboardInterrupt:
         raise
     except BaseException as exception:  # noqa: BLE001
-        object.__setattr__(task_result, "finished_at", timezone.now())
-        task_result.errors.append(_create_task_error(exception))
-        object.__setattr__(task_result, "status", TaskResultStatus.FAILED)
+        task_result = dataclasses.replace(
+            task_result,
+            finished_at=timezone.now(),
+            status=TaskResultStatus.FAILED,
+            errors=[*task_result.errors, _create_task_error(exception)],
+        )
     else:
-        object.__setattr__(task_result, "finished_at", timezone.now())
-        object.__setattr__(task_result, "_return_value", normalize_json(raw_return_value))
-        object.__setattr__(task_result, "status", TaskResultStatus.SUCCESSFUL)
+        task_result = dataclasses.replace(
+            task_result,
+            finished_at=timezone.now(),
+            status=TaskResultStatus.SUCCESSFUL,
+        )
 
     task_finished.send(TaskExecutor, task_result=task_result)
     return task_result
 
 
 
-def _call_task(task_result: TaskResult) -> Any:
-    """Call task with context when required."""
+def _call_task(task_result: TaskResult) -> typing.Any:
+    """Call a task with context when required."""
     task = task_result.task
     match task.takes_context:
         case True:
@@ -257,7 +254,7 @@ def _call_task(task_result: TaskResult) -> Any:
 
 
 def _create_task_error(exception: BaseException) -> TaskError:
-    """Build task error payload for failed execution."""
+    """Build a task error payload for failed execution."""
     exception_type = type(exception)
     return TaskError(
         exception_class_path=f"{exception_type.__module__}.{exception_type.__qualname__}",
