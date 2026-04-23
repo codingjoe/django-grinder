@@ -4,7 +4,7 @@ import sys
 from django.core.management import BaseCommand
 from django.tasks import task_backends
 
-from ... import Executor
+from ...executor import TaskExecutor
 
 
 def kill_softly(signum, frame):
@@ -91,7 +91,7 @@ class Command(BaseCommand):
         self.stdout.write(self.style.SUCCESS("Starting worker…"))
         backend_alias = backends[0] if isinstance(backends, list) else backends
         backend = task_backends[backend_alias]
-        exe = Executor(
+        exe = TaskExecutor(
             backend=backend,
             workers=workers,
             threads=threads,
