@@ -146,15 +146,32 @@ class ThreadmillTaskBackend(BaseTaskBackend, ABC):
                 task_data = d["task"]
                 func = import_string(task_data["func"])
                 if isinstance(func, cls.task_class):
-                    func = func.func
-                d["task"] = cls.task_class(
-                    func=func,
-                    **{
-                        field.name: _parse_datetime(task_data[field.name])
-                        for field in dataclasses.fields(cls.task_class)
+                    # Use the actual subclass (e.g. RetryableTask) so that
+                    # subclass-specific fields like retry_fn are preserved.
+                    task_cls = type(func)
+                    original_task = func
+                    func = original_task.func
+                else:
+                    task_cls = cls.task_class
+                    original_task = None
+                fields_from_data = {
+                    field.name: _parse_datetime(task_data[field.name])
+                    for field in dataclasses.fields(task_cls)
+                    if field.name not in {"func", "takes_context"}
+                    and field.name in task_data
+                }
+                fields_from_original = (
+                    {
+                        field.name: getattr(original_task, field.name)
+                        for field in dataclasses.fields(task_cls)
                         if field.name not in {"func", "takes_context"}
-                        and field.name in task_data
-                    },
+                        and field.name not in fields_from_data
+                    }
+                    if original_task is not None
+                    else {}
+                )
+                d["task"] = task_cls(
+                    func=func, **fields_from_data, **fields_from_original
                 )
                 d["status"] = TaskResultStatus(d["status"])
                 d["errors"] = [TaskError(**error) for error in d["errors"]]

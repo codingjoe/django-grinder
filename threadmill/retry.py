@@ -2,17 +2,21 @@
 
 from __future__ import annotations
 
+import dataclasses
 import datetime
 from collections.abc import Callable
 
-from django.tasks import (
-    DEFAULT_TASK_BACKEND_ALIAS,
-    DEFAULT_TASK_QUEUE_NAME,
-    task as django_task,
-)
+from django.tasks import DEFAULT_TASK_BACKEND_ALIAS, DEFAULT_TASK_QUEUE_NAME, Task
 from django.tasks.base import DEFAULT_TASK_PRIORITY, TaskContext
 
 RetryFunction = Callable[[TaskContext], datetime.timedelta | None]
+
+
+@dataclasses.dataclass(frozen=True, slots=True, kw_only=True)
+class RetryableTask(Task):
+    """A task that retries automatically on failure via a configurable retry function."""
+
+    retry_fn: RetryFunction | None = None
 
 
 def exponential_backoff(
@@ -103,30 +107,29 @@ def task(
 ):
     """Decorate a function as a Django task with optional retry support.
 
-    Wraps :func:`django.tasks.task` and accepts an additional ``retry_fn``
-    parameter.  When provided, ``retry_fn`` is stored on the underlying
-    function so the executor can look it up after a failure.
+    Returns a :class:`RetryableTask` instance, which stores ``retry_fn``
+    as a proper field so the executor can look it up after a failure.
 
     Args:
         function: The function to decorate (when used without arguments).
-        priority: Task priority passed to the underlying Django task.
-        queue_name: Queue name passed to the underlying Django task.
-        backend: Backend alias passed to the underlying Django task.
+        priority: Task priority.
+        queue_name: Queue name.
+        backend: Backend alias.
         takes_context: Whether the task receives a :class:`~django.tasks.TaskContext`.
         retry_fn: Called on failure; returns the delay until the next attempt
             or ``None`` to stop retrying.
     """
 
     def wrapper(f):
-        task_instance = django_task(
+        return RetryableTask(
             priority=priority,
+            func=f,
             queue_name=queue_name,
             backend=backend,
             takes_context=takes_context,
-        )(f)
-        if retry_fn is not None:
-            task_instance.func.retry_fn = retry_fn
-        return task_instance
+            run_after=None,
+            retry_fn=retry_fn,
+        )
 
     if function is not None:
         return wrapper(function)

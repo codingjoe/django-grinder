@@ -256,7 +256,7 @@ class WorkerThread(threading.Thread):
 
     def retry(self, task_result: TaskResult) -> None:
         """Schedule a retry for a failed task if a retry function is configured."""
-        retry_fn = getattr(task_result.task.func, "retry_fn", None)
+        retry_fn = getattr(task_result.task, "retry_fn", None)
         if retry_fn is None:
             return
         delay = retry_fn(TaskContext(task_result=task_result))
