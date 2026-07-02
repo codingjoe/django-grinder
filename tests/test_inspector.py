@@ -21,16 +21,21 @@ from textual.widgets._data_table import RowKey
 from tests.testapp.tasks import echo
 from threadmill.backends.base import (
     BackendTelemetry,
+    NodeTelemetry,
     QueueCounts,
     QueueRates,
     QueueStats,
     ThreadmillTaskBackend,
+    WorkerTelemetry,
 )
 from threadmill.inspector.app import (
     InspectorApp,
     QueueList,
+    SelectionTree,
     TaskDetail,
     TaskList,
+    WorkerGraphs,
+    WorkerTreeNode,
     si_prefix,
 )
 
@@ -46,6 +51,9 @@ class FailingBackend(ThreadmillTaskBackend):
 
     def telemetry(self, *, interval=None):
         raise RuntimeError("telemetry failed")
+
+    def worker_telemetry(self):
+        raise RuntimeError("worker_telemetry failed")
 
 
 def _failed_result() -> TaskResult:
@@ -102,9 +110,14 @@ def _stats(**overrides: int | datetime.timedelta) -> QueueStats:
         (3_500_000, "3.5M"),
     ],
 )
-def test_si_prefix(count: int, expected: str) -> None:
+def test_si_prefix(count: int, expected: str):
     """Large counts are compacted with k/M/G suffixes."""
     assert si_prefix(count) == expected
+
+
+def test_si_prefix__bytes():
+    """Size in bytes can be abbreviated with base=1024."""
+    assert si_prefix(2048 * 1024 * 1024, base=1024) == "2G"
 
 
 class TestInspectorApp:
@@ -511,3 +524,551 @@ class TestInspectorApp:
             await pilot.pause()
             await pilot.pause()
             assert table.row_count == before - 1
+
+
+def _make_worker_telemetry(
+    *,
+    hostname: str = "node-1",
+    pid: int = 1234,
+    queue_name: str = "default",
+) -> WorkerTelemetry:
+    """Build a WorkerTelemetry snapshot for inspector tests."""
+    now = datetime.datetime.now(tz=datetime.UTC)
+    node = NodeTelemetry(
+        hostname=hostname,
+        pid=pid,
+        queues=(queue_name,),
+        process_count=1,
+        thread_count=2,
+        cpu_percent=45.0,
+        memory_bytes=4_000_000_000,
+        memory_total=8_000_000_000,
+        tasks_per_minute=30.0,
+        sampled_at=now,
+    )
+    return WorkerTelemetry(
+        nodes={hostname: node},
+        queues={queue_name: (hostname,)},
+        sampled_at=now,
+    )
+
+
+def _queue_telemetry(*queues: str) -> BackendTelemetry:
+    """Build a BackendTelemetry listing the defined queues for the selection tree."""
+    return BackendTelemetry(queues={name: _stats() for name in queues})
+
+
+class TestWorkerView:
+    """Tests for the worker view (selection tree, graphs, toggle)."""
+
+    async def test_selection_tree_builds_from_telemetry(self):
+        """The selection tree renders Queue -> Node from telemetry."""
+        app = InspectorApp(backend=default_task_backend, auto_refresh=False)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            tree = app.query_one("#selection-tree", SelectionTree)
+            tree.queue_telemetry = _queue_telemetry("default")
+            snapshot = _make_worker_telemetry()
+            tree.worker_telemetry = snapshot
+            await pilot.pause()
+            root = tree.root
+            assert len(root.children) == 1
+            queue_node = root.children[0]
+            assert queue_node.data.kind == "queue"
+            assert queue_node.data.queue_name == "default"
+            assert queue_node.label.plain == "default (1)"
+            assert len(queue_node.children) == 1
+            host_node = queue_node.children[0]
+            assert host_node.data.kind == "node"
+            assert host_node.data.hostname == "node-1"
+
+    async def test_selection_tree_shows_unstaffed_queue_with_zero(self):
+        """A defined queue with no draining nodes renders as 'queue (0)'."""
+        app = InspectorApp(backend=default_task_backend, auto_refresh=False)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            tree = app.query_one("#selection-tree", SelectionTree)
+            tree.queue_telemetry = _queue_telemetry("default", "io")
+            tree.worker_telemetry = _make_worker_telemetry()
+            await pilot.pause()
+            labels = [child.label.plain for child in tree.root.children]
+            assert "default (1)" in labels
+            assert "io (0)" in labels
+            io_node = next(
+                child for child in tree.root.children if child.data.queue_name == "io"
+            )
+            assert len(io_node.children) == 0
+
+    def test_memory_percent_handles_zero_total(self):
+        """_memory_percent returns 0 when total RAM is unknown (<=0)."""
+        node = NodeTelemetry(
+            hostname="h",
+            pid=1,
+            queues=("default",),
+            process_count=1,
+            thread_count=1,
+            cpu_percent=0.0,
+            memory_bytes=100,
+            memory_total=0,
+            tasks_per_minute=0.0,
+            sampled_at=datetime.datetime.now(tz=datetime.UTC),
+        )
+        assert WorkerGraphs._memory_percent(node) == 0.0
+
+    def test_memory_percent_computes_ratio(self):
+        """_memory_percent derives the usage ratio from used/total RAM."""
+        node = NodeTelemetry(
+            hostname="h",
+            pid=1,
+            queues=("default",),
+            process_count=1,
+            thread_count=1,
+            cpu_percent=0.0,
+            memory_bytes=4_000_000_000,
+            memory_total=8_000_000_000,
+            tasks_per_minute=0.0,
+            sampled_at=datetime.datetime.now(tz=datetime.UTC),
+        )
+        assert WorkerGraphs._memory_percent(node) == 50.0
+
+    async def test_worker_graphs_ram_border_title(self):
+        """The memory border title shows used/total RAM and the derived percent."""
+        app = InspectorApp(backend=default_task_backend, auto_refresh=False)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            graphs = app.query_one("#worker-graphs", WorkerGraphs)
+            graphs.selection = WorkerTreeNode(
+                kind="node", label="node-1", hostname="node-1"
+            )
+            graphs.worker_telemetry = _make_worker_telemetry()
+            await pilot.pause()
+            graphs._refresh_graphs()
+            await pilot.pause()
+            mem = graphs.query_one("#worker-memory-graph")
+            assert "RAM" in mem.border_title
+            assert "4GB/8GB" in mem.border_title
+            assert "50%" in mem.border_title
+
+    async def test_toggle_view_shows_worker_widgets(self):
+        """Pressing 'v' shows the worker view and hides the queue view."""
+        app = InspectorApp(backend=default_task_backend, auto_refresh=False)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            assert app.worker_view_enabled is False
+            assert app.query_one("#queue-view").display
+            assert not app.query_one("#worker-view").display
+            await pilot.press("v")
+            await pilot.pause()
+            assert app.worker_view_enabled is True
+            assert not app.query_one("#queue-view").display
+            assert app.query_one("#worker-view").display
+
+    async def test_toggle_view_back_to_queue(self):
+        """Pressing 'v' again returns to the queue view."""
+        app = InspectorApp(backend=default_task_backend, auto_refresh=False)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await pilot.press("v")
+            await pilot.pause()
+            assert app.worker_view_enabled is True
+            await pilot.press("v")
+            await pilot.pause()
+            assert app.worker_view_enabled is False
+            assert app.query_one("#queue-list", QueueList).display
+
+    async def test_toggle_binding_label_updates(self):
+        """The 'v' binding description changes with the current view."""
+        from textual.binding import Binding
+
+        app = InspectorApp(backend=default_task_backend, auto_refresh=False)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            assert app.worker_view_enabled is False
+            binding = app._bindings.key_to_bindings["v"][0]
+            assert isinstance(binding, Binding)
+            assert binding.description == "Toggle Worker View"
+            await pilot.press("v")
+            await pilot.pause()
+            assert app.worker_view_enabled is True
+            binding = app._bindings.key_to_bindings["v"][0]
+            assert binding.description == "Toggle Queue View"
+
+    async def test_worker_graphs_update_on_selection(self):
+        """Selecting a node feeds the worker graphs."""
+        app = InspectorApp(backend=default_task_backend, auto_refresh=False)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            tree = app.query_one("#selection-tree", SelectionTree)
+            tree.queue_telemetry = _queue_telemetry("default")
+            graphs = app.query_one("#worker-graphs", WorkerGraphs)
+            snapshot = _make_worker_telemetry()
+            tree.worker_telemetry = snapshot
+            await pilot.pause()
+            # Select the node
+            root = tree.root
+            queue_node = root.children[0]
+            host_node = queue_node.children[0]
+            tree.select_node(host_node)
+            tree.action_select_cursor()
+            await pilot.pause()
+            assert graphs.selection is not None
+            assert graphs.selection.kind == "node"
+            assert graphs.selection.hostname == "node-1"
+
+    async def test_worker_graphs_append_history_on_telemetry(self):
+        """Worker graphs accumulate data points when a sample tick fires."""
+        app = InspectorApp(backend=default_task_backend, auto_refresh=False)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            graphs = app.query_one("#worker-graphs", WorkerGraphs)
+            snapshot = _make_worker_telemetry()
+            # Set selection first
+            node_data = WorkerTreeNode(
+                kind="node",
+                label="node-1",
+                hostname="node-1",
+            )
+            graphs.selection = node_data
+            await pilot.pause()
+            # History is pre-filled with zeros at the fixed window size.
+            assert len(graphs._cpu_history) == graphs.GRAPH_HISTORY_SIZE
+            graphs.worker_telemetry = snapshot
+            await pilot.pause()
+            # A telemetry update alone does not append a sample — only the
+            # fixed-interval timer does.  Simulate a timer tick.
+            graphs._refresh_graphs()
+            await pilot.pause()
+            # The last entry is the new sample; length stays fixed.
+            assert len(graphs._cpu_history) == graphs.GRAPH_HISTORY_SIZE
+            assert graphs._cpu_history[-1] == 45.0
+
+    async def test_refresh_telemetry_fetches_worker_telemetry(self):
+        """_refresh_telemetry populates the worker_telemetry reactive."""
+        app = InspectorApp(backend=default_task_backend, auto_refresh=False)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app._refresh_telemetry()
+            await pilot.pause()
+            # The default backend returns an empty snapshot
+            assert app.worker_telemetry is not None
+            assert app.worker_telemetry.nodes == {}
+
+    async def test_selection_tree_preserves_cursor_on_update(self):
+        """The tree restores the cursor to the same node after a telemetry update."""
+        app = InspectorApp(backend=default_task_backend, auto_refresh=False)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            tree = app.query_one("#selection-tree", SelectionTree)
+            tree.queue_telemetry = _queue_telemetry("default")
+            tree.worker_telemetry = _make_worker_telemetry()
+            await pilot.pause()
+            # Move cursor to the node
+            root = tree.root
+            queue_node = root.children[0]
+            host_node = queue_node.children[0]
+            tree.select_node(host_node)
+            await pilot.pause()
+            # Send a new telemetry snapshot
+            tree.worker_telemetry = _make_worker_telemetry()
+            await pilot.pause()
+            assert tree.cursor_node is not None
+            assert tree.cursor_node.data.kind == "node"
+
+    async def test_worker_graphs_show_node_selection(self):
+        """Selecting a node shows node-level metrics in the graphs."""
+        app = InspectorApp(backend=default_task_backend, auto_refresh=False)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            tree = app.query_one("#selection-tree", SelectionTree)
+            tree.queue_telemetry = _queue_telemetry("default")
+            graphs = app.query_one("#worker-graphs", WorkerGraphs)
+            snapshot = _make_worker_telemetry()
+            tree.worker_telemetry = snapshot
+            await pilot.pause()
+            root = tree.root
+            queue_node = root.children[0]
+            host_node = queue_node.children[0]
+            tree.select_node(host_node)
+            await pilot.pause()
+            graphs.selection = host_node.data
+            graphs.worker_telemetry = snapshot
+            await pilot.pause()
+            graphs._refresh_graphs()
+            await pilot.pause()
+            assert len(graphs._cpu_history) == graphs.GRAPH_HISTORY_SIZE
+            assert graphs._cpu_history[-1] == 45.0
+
+    async def test_selection_tree_resets_cursor_when_node_gone(self):
+        """_find_node_by_data returns None when the previous node is gone."""
+        app = InspectorApp(backend=default_task_backend, auto_refresh=False)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            tree = app.query_one("#selection-tree", SelectionTree)
+            tree.queue_telemetry = _queue_telemetry("default")
+            tree.worker_telemetry = _make_worker_telemetry()
+            await pilot.pause()
+            # Capture the node data, then build a different snapshot
+            root = tree.root
+            queue_node = root.children[0]
+            host_node = queue_node.children[0]
+            old_data = host_node.data
+            # New snapshot with a different hostname
+            tree.worker_telemetry = _make_worker_telemetry(hostname="node-2")
+            await pilot.pause()
+            # The old node data is not in the new tree
+            result = SelectionTree._find_node_by_data(tree.root, old_data)
+            assert result is None
+
+    async def test_worker_graphs_reset_on_selection_change(self):
+        """Changing the selection resets the graph histories."""
+        app = InspectorApp(backend=default_task_backend, auto_refresh=False)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            graphs = app.query_one("#worker-graphs", WorkerGraphs)
+            node_data = WorkerTreeNode(kind="node", label="node-1", hostname="node-1")
+            graphs.selection = node_data
+            await pilot.pause()
+            graphs.worker_telemetry = _make_worker_telemetry()
+            await pilot.pause()
+            assert len(graphs._cpu_history) == graphs.GRAPH_HISTORY_SIZE
+            # Change selection to a different node — watch_selection resets
+            # histories, then _refresh_graphs appends from the current telemetry.
+            graphs.selection = WorkerTreeNode(
+                kind="node",
+                label="node-2",
+                hostname="node-2",
+            )
+            await pilot.pause()
+            # After reset, histories are pre-filled with zeros; node-2 is not
+            # in telemetry, so no new sample is appended.
+            assert len(graphs._cpu_history) == graphs.GRAPH_HISTORY_SIZE
+            assert graphs._cpu_history[-1] == 0.0
+
+    async def test_worker_graphs_ignore_missing_node(self):
+        """Graphs do nothing when the selected node is not in the telemetry."""
+        app = InspectorApp(backend=default_task_backend, auto_refresh=False)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            graphs = app.query_one("#worker-graphs", WorkerGraphs)
+            graphs.selection = WorkerTreeNode(
+                kind="node", label="ghost", hostname="ghost"
+            )
+            await pilot.pause()
+            graphs.worker_telemetry = _make_worker_telemetry()
+            await pilot.pause()
+            assert len(graphs._cpu_history) == graphs.GRAPH_HISTORY_SIZE
+            assert graphs._cpu_history[-1] == 0.0
+
+    async def test_refresh_telemetry_logs_on_worker_telemetry_error(self):
+        """_refresh_telemetry logs when worker_telemetry raises."""
+        backend = FailingBackend(alias="default", params={})
+        app = InspectorApp(backend=backend, auto_refresh=False)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            # The exception is caught and logged; the app does not crash.
+            assert app.worker_telemetry is not None
+
+    async def test_selection_tree_skips_queue_with_missing_node(self):
+        """The tree skips a queue whose hostname is not in the nodes dict."""
+        app = InspectorApp(backend=default_task_backend, auto_refresh=False)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            tree = app.query_one("#selection-tree", SelectionTree)
+            tree.queue_telemetry = _queue_telemetry("default")
+            now = datetime.datetime.now(tz=datetime.UTC)
+            snapshot = WorkerTelemetry(
+                nodes={},
+                queues={"default": ("ghost-host",)},
+                sampled_at=now,
+            )
+            tree.worker_telemetry = snapshot
+            await pilot.pause()
+            root = tree.root
+            assert len(root.children) == 1
+            queue_node = root.children[0]
+            assert len(queue_node.children) == 0
+
+    async def test_worker_graphs_ignore_non_node_selection(self):
+        """Graphs skip when the selection kind is not 'node'."""
+        app = InspectorApp(backend=default_task_backend, auto_refresh=False)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            graphs = app.query_one("#worker-graphs", WorkerGraphs)
+            # Use a valid hostname but a queue kind so _refresh_graphs returns early
+            graphs.selection = WorkerTreeNode(
+                kind="queue",
+                label="default",
+                queue_name="default",
+                hostname="node-1",
+            )
+            await pilot.pause()
+            graphs.worker_telemetry = _make_worker_telemetry()
+            await pilot.pause()
+            assert len(graphs._cpu_history) == graphs.GRAPH_HISTORY_SIZE
+            assert graphs._cpu_history[-1] == 0.0
+
+    async def test_worker_graphs_handles_unmounted_widgets(self):
+        """_refresh_graphs logs when Sparkline widgets are not yet mounted."""
+        from unittest.mock import patch
+
+        app = InspectorApp(backend=default_task_backend, auto_refresh=False)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            graphs = app.query_one("#worker-graphs", WorkerGraphs)
+            graphs.selection = WorkerTreeNode(
+                kind="node", label="node-1", hostname="node-1"
+            )
+            await pilot.pause()
+            # Patch query_one to raise as if widgets are not mounted.
+            with patch.object(graphs, "query_one", side_effect=Exception("no widget")):
+                graphs.worker_telemetry = _make_worker_telemetry()
+                await pilot.pause()
+            # Histories are populated even though the graph redraw failed.
+            assert len(graphs._cpu_history) == graphs.GRAPH_HISTORY_SIZE
+
+
+class _StubBackend(ThreadmillTaskBackend):
+    """Backend double that yields a fixed worker telemetry snapshot."""
+
+    def enqueue(self, task, args, kwargs):
+        raise NotImplementedError
+
+    def peek(self, *args, **kwargs):
+        raise NotImplementedError
+
+    def telemetry(self, *args, **kwargs):
+        raise NotImplementedError
+
+    def worker_telemetry(self):
+        raise NotImplementedError
+
+    async def subscribe_worker_telemetry(self):
+        yield _make_worker_telemetry()
+
+
+class _ExplodingBackend(_StubBackend):
+    """Backend whose pub/sub subscription raises immediately."""
+
+    async def subscribe_worker_telemetry(self):
+        raise RuntimeError("subscribe failed")
+        yield  # pragma: no cover
+
+
+def _make_node(
+    *,
+    hostname: str = "node-1",
+    pid: int = 100,
+    queue_name: str = "default",
+    thread_count: int = 2,
+    sampled_at: datetime.datetime | None = None,
+) -> NodeTelemetry:
+    """Build a per-process NodeTelemetry for cache-population tests."""
+    now = sampled_at or datetime.datetime.now(tz=datetime.UTC)
+    return NodeTelemetry(
+        hostname=hostname,
+        pid=pid,
+        queues=(queue_name,),
+        process_count=1,
+        thread_count=thread_count,
+        cpu_percent=45.0,
+        memory_bytes=8_000_000_000,
+        memory_total=16_000_000_000,
+        tasks_per_minute=30.0,
+        sampled_at=now,
+    )
+
+
+class TestWorkerNodeCache:
+    """Tests for the inspector's latest-per-host node cache and rebuild."""
+
+    async def test_subscribe_caches_node_by_hostname(self):
+        """A subscribed snapshot is cached keyed by hostname."""
+        app = InspectorApp(
+            backend=_StubBackend(alias="default", params={}), auto_refresh=False
+        )
+        await app._subscribe_worker_telemetry()
+        assert "node-1" in app._node_cache
+        assert app._node_cache["node-1"].hostname == "node-1"
+
+    def test_latest_snapshot_wins_for_same_host(self):
+        """Two snapshots from the same host keep only the most recent one."""
+        app = InspectorApp(
+            backend=_StubBackend(alias="default", params={}), auto_refresh=False
+        )
+        app._node_cache["node-1"] = _make_node(pid=100, queue_name="default")
+        app._node_cache["node-1"] = _make_node(pid=200, queue_name="celery")
+        assert len(app._node_cache) == 1
+        assert app._node_cache["node-1"].pid == 200
+
+    def test_prune_drops_stale_nodes(self):
+        """_prune_nodes drops entries older than the TTL."""
+        app = InspectorApp(
+            backend=_StubBackend(alias="default", params={}), auto_refresh=False
+        )
+        old = datetime.datetime.now(tz=datetime.UTC) - datetime.timedelta(seconds=20)
+        app._node_cache["node-1"] = dataclasses.replace(_make_node(), sampled_at=old)
+        app._prune_nodes(10)
+        assert "node-1" not in app._node_cache
+
+    def test_prune_keeps_fresh_nodes(self):
+        """_prune_nodes retains entries within the TTL window."""
+        app = InspectorApp(
+            backend=_StubBackend(alias="default", params={}), auto_refresh=False
+        )
+        app._node_cache["node-1"] = _make_node()
+        app._prune_nodes(10)
+        assert "node-1" in app._node_cache
+
+    def test_build_includes_nodes_and_queue_index(self):
+        """_build_worker_telemetry returns cached nodes plus a queue->host index."""
+        app = InspectorApp(
+            backend=_StubBackend(alias="default", params={}), auto_refresh=False
+        )
+        app._node_cache["node-1"] = _make_node(pid=100, queue_name="default")
+        app._node_cache["node-2"] = _make_node(
+            hostname="node-2", pid=200, queue_name="celery"
+        )
+        snapshot = app._build_worker_telemetry()
+        assert set(snapshot.nodes) == {"node-1", "node-2"}
+        assert set(snapshot.queues) == {"default", "celery"}
+        assert snapshot.queues["default"] == ("node-1",)
+        assert snapshot.queues["celery"] == ("node-2",)
+
+    def test_build_empty_cache_returns_empty(self):
+        """_build_worker_telemetry returns empty nodes/queues from an empty cache."""
+        app = InspectorApp(
+            backend=_StubBackend(alias="default", params={}), auto_refresh=False
+        )
+        snapshot = app._build_worker_telemetry()
+        assert snapshot.nodes == {}
+        assert snapshot.queues == {}
+
+    async def test_refresh_rebuilds_worker_telemetry_from_cache(self):
+        """_refresh_telemetry rebuilds worker_telemetry when the cache is populated."""
+        app = InspectorApp(backend=default_task_backend, auto_refresh=False)
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app._node_cache["node-1"] = _make_node()
+            app._refresh_telemetry()
+            await pilot.pause()
+            assert app.worker_telemetry is not None
+            assert "node-1" in app.worker_telemetry.nodes
+
+
+class TestWorkerTelemetrySubscription:
+    """Tests for the inspector's pub/sub subscription lifecycle."""
+
+    async def test_subscribe_worker_telemetry_caches_snapshot(self):
+        """_subscribe_worker_telemetry caches the snapshot per host."""
+        backend = _StubBackend(alias="default", params={})
+        app = InspectorApp(backend=backend, auto_refresh=False)
+        await app._subscribe_worker_telemetry()
+        assert app._node_cache
+        assert "node-1" in app._node_cache
+
+    async def test_subscribe_worker_telemetry_logs_on_error(self):
+        """A failing subscription is caught and logged without crashing."""
+        backend = _ExplodingBackend(alias="default", params={})
+        app = InspectorApp(backend=backend, auto_refresh=False)
+        await app._subscribe_worker_telemetry()
+        assert not app._node_cache

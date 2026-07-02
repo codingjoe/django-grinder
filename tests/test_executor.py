@@ -55,12 +55,13 @@ def _task_result(task, *args, **kwargs) -> TaskResult:
 
 
 def _make_worker(*, max_tasks: int | None = None) -> WorkerProcess:
-    """Build an unstarted `WorkerProcess`."""
+    """Build an unstarted `WorkerProcess` with a fresh shared task counter."""
     return WorkerProcess(
         thread_count=1,
         max_tasks=max_tasks,
         backend_alias="default",
         queues=("default",),
+        total_counter=multiprocessing.Value("q", 0),
     )
 
 
@@ -190,6 +191,16 @@ class TestTaskExecutor:
         executor.shutdown()
         assert not worker.is_alive()
 
+    def test_shutdown__stops_telemetry_sampler(self):
+        """Shutdown stops the telemetry sampler when one is running."""
+        from unittest.mock import MagicMock
+
+        sampler = MagicMock()
+        executor = TaskExecutor(backend=default_task_backend, queues=("default",))
+        executor.telemetry_sampler = sampler
+        executor.shutdown()
+        sampler.stop.assert_called_once()
+
     def test_maintain_worker_pool__restarts_dead_workers(self):
         """maintain_worker_pool replaces dead workers with new ones."""
         executor = TaskExecutor(
@@ -217,12 +228,13 @@ class TestWorkerProcess:
     """Tests for the WorkerProcess class."""
 
     def test_record_task__increments_count(self):
-        """record_task increments task_count."""
+        """record_task increments task_count and the shared counter."""
         worker = _make_worker(max_tasks=5)
         worker.lock = threading.Lock()
         worker.expired = threading.Event()
         worker.record_task()
         assert worker.task_count == 1
+        assert worker.total_counter.value == 1
 
     def test_record_task__sets_expired_when_max_reached(self):
         """record_task sets expired event when max_tasks is reached."""
@@ -233,19 +245,21 @@ class TestWorkerProcess:
         assert worker.expired.is_set()
 
     def test_record_task__noop_when_max_tasks_is_none(self):
-        """record_task is a no-op when max_tasks is None."""
+        """record_task still counts throughput when max_tasks is None."""
         worker = _make_worker(max_tasks=None)
         worker.lock = threading.Lock()
         worker.expired = threading.Event()
         worker.record_task()
         assert worker.task_count == 0
         assert not worker.expired.is_set()
+        assert worker.total_counter.value == 1
 
     def test_record_task__noop_before_run_sets_lock_and_expired(self):
-        """record_task is a safe no-op before run() initializes lock/expired."""
+        """record_task counts but skips recycling before run() sets lock/expired."""
         worker = _make_worker(max_tasks=5)
         worker.record_task()
         assert worker.task_count == 0
+        assert worker.total_counter.value == 1
 
     def test_shutdown_requested__is_settable(self):
         """shutdown_requested event can be set on an unstarted worker."""

@@ -33,8 +33,12 @@ Select {
     }
 }
 
-#left-pane {
+.left-pane {
     width: 42;
+}
+
+#queue-view, #worker-view {
+    height: 1fr;
 }
 
 #backend-row {
@@ -103,4 +107,37 @@ TaskDetail {
     width: 100%;
     overflow: scroll;
     padding: 0 1;
+}
+
+#selection-tree {
+    height: 1fr;
+    width: 100%;
+    border: round $accent 40%;
+    border-title-color: $primary;
+    border-title-align: right;
+    background: $background;
+    padding: 0 1;
+
+    &:focus-within {
+        border: round $accent 100%;
+    }
+}
+
+#worker-graphs Sparkline {
+    height: 1fr;
+    border: round $accent 40%;
+    border-title-color: $primary;
+    border-title-align: right;
+}
+
+#worker-throughput-graph {
+    color: $primary;
+}
+
+#worker-cpu-graph {
+    color: $warning;
+}
+
+#worker-memory-graph {
+    color: $success;
 }

@@ -4,340 +4,60 @@ from __future__ import annotations
 
 import datetime
 import logging
-import math
-import typing
-from typing import Any
 
-from django.contrib.humanize.templatetags.humanize import naturaltime
-from django.tasks import (
-    DEFAULT_TASK_QUEUE_NAME,
-    TaskResult,
-    TaskResultStatus,
-    task_backends,
-)
+from django.tasks import task_backends
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.reactive import reactive
-from textual.theme import BUILTIN_THEMES
 from textual.widgets import (
-    DataTable,
     Footer,
     ListItem,
     ListView,
     Select,
     Static,
-    TabbedContent,
-    TabPane,
+    Tree,
 )
 
-from ..backends.base import BackendTelemetry, ThreadmillTaskBackend
+from ..backends.base import (
+    BackendTelemetry,
+    NodeTelemetry,
+    ThreadmillTaskBackend,
+    WorkerTelemetry,
+)
+from .queue_view import (
+    TAB_KEYS,
+    QueueItem,
+    QueueList,
+    TaskDetail,
+    TaskList,
+)
+from .utils import (
+    si_prefix,
+    supported_aliases as _supported_aliases,
+)
+from .worker_view import (
+    SelectionTree,
+    WorkerGraphs,
+    WorkerTreeNode,
+)
 
 logger = logging.getLogger(__name__)
 
 TELEMETRY_INTERVAL_SECONDS = 2.0
 """Seconds between automatic queue-stat refreshes; the task list stays manual."""
 
-TAB_STATUSES: list[tuple[str, TaskResultStatus | None]] = [
-    ("Running", TaskResultStatus.RUNNING),
-    ("Ready", TaskResultStatus.READY),
-    ("Successful", TaskResultStatus.SUCCESSFUL),
-    ("Failed", TaskResultStatus.FAILED),
+__all__ = [
+    "InspectorApp",
+    "QueueItem",
+    "QueueList",
+    "SelectionTree",
+    "TaskDetail",
+    "TaskList",
+    "WorkerGraphs",
+    "WorkerTreeNode",
+    "si_prefix",
 ]
-
-
-class QueueItem(ListItem):
-    """A list item that exposes its queue name."""
-
-    def __init__(self, queue_name: str, label: str, **kwargs: Any) -> None:
-        super().__init__(Static(label), id=f"queue-{queue_name}", **kwargs)
-        self.queue_name = queue_name
-
-
-def _supported_aliases() -> typing.Generator[tuple[str, str]]:
-    for alias in task_backends:
-        if isinstance(task_backends[alias], ThreadmillTaskBackend):
-            yield alias, alias
-
-
-def _format_dt(value: datetime.datetime | None) -> str:
-    return value.isoformat() if value else ""
-
-
-def si_prefix(n: int) -> str:
-    """Round and shorten a number with an SI prefix (k, M, G, etc.)."""
-    if n < 1000:
-        return str(n)
-    prefixes = ["", "k", "M", "G", "T", "P", "E", "Z", "Y"]
-    m = min(int(math.log10(abs(n)) // 3), len(prefixes) - 1)
-    if (value := n / 1000**m) and value >= 100:
-        return f"{int(value)}{prefixes[m]}"
-    return f"{value:.1f}".rstrip("0").rstrip(".") + prefixes[m]
-
-
-COLUMN_LABELS: dict[str, str] = {
-    "id": "ID",
-    "priority": "Priority",
-    "function": "Function",
-    "enqueued": "Enqueued",
-    "started": "Started",
-    "finished": "Finished",
-    "workers": "Workers",
-}
-
-TAB_COLUMNS: dict[str, tuple[str, ...]] = {
-    "running": ("id", "function", "enqueued", "started", "workers"),
-    "ready": ("id", "function", "priority", "enqueued"),
-    "successful": ("id", "function", "enqueued", "started", "finished", "workers"),
-    "failed": ("id", "function", "enqueued", "started", "finished", "workers"),
-}
-
-TAB_KEYS = {
-    label.lower(): str(index + 1) for index, (label, _) in enumerate(TAB_STATUSES)
-}
-
-
-def _cell(result: TaskResult, column: str) -> str:
-    match column:
-        case "id":
-            return result.id[:8]
-        case "function":
-            return result.task.module_path
-        case "priority":
-            return str(result.task.priority)
-        case "enqueued":
-            return naturaltime(result.enqueued_at)
-        case "started":
-            return naturaltime(result.started_at)
-        case "finished":
-            return naturaltime(result.finished_at)
-        case "workers":
-            return ", ".join(result.worker_ids) or "-"
-
-
-class TaskDetail(Static):
-    """Read-only detail view for the selected task result."""
-
-    task_result: reactive[TaskResult | None] = reactive(None)
-
-    def compose(self) -> ComposeResult:
-        yield from super().compose()
-        self.border_title = "Detail"
-
-    def watch_task_result(self) -> None:
-        self.update(self._detail_content())
-
-    def _detail_content(self) -> str:
-        """Build the detail text for the current task."""
-        result = self.task_result
-        if result is None:
-            return "Select a task to view details."
-        lines = [
-            f"[b]Task:[/b] {result.task.module_path}",
-            f"[b]ID:[/b] {result.id}",
-            f"[b]Status:[/b] {result.status.name}",
-            f"[b]Queue:[/b] {result.task.queue_name}",
-            f"[b]Priority:[/b] {result.task.priority}",
-            f"[b]Enqueued:[/b] {_format_dt(result.enqueued_at)}",
-            f"[b]Started:[/b] {_format_dt(result.started_at)}",
-            f"[b]Finished:[/b] {_format_dt(result.finished_at)}",
-            f"[b]Last attempted:[/b] {_format_dt(result.last_attempted_at)}",
-            f"[b]Worker IDs:[/b] {', '.join(result.worker_ids) or '-'}",
-            f"[b]Args:[/b] {result.args!r}",
-            f"[b]Kwargs:[/b] {result.kwargs!r}",
-        ]
-        if result.errors:
-            lines.append("")
-            lines.append("[b]Errors:[/b]")
-            for error in result.errors:
-                lines.append(f"  {error.exception_class_path}")
-                for line in error.traceback.splitlines():
-                    lines.append(f"    {line}")
-        return "\n".join(lines)
-
-
-class TaskList(Vertical):
-    """Tabbed list of tasks for the selected queue."""
-
-    backend: reactive[ThreadmillTaskBackend | None] = reactive(None)
-    queue_name: reactive[str] = reactive("")
-    telemetry: reactive[BackendTelemetry | None] = reactive(None)
-    counts: reactive[dict[str, int]] = reactive({})
-    selected_task: reactive[TaskResult | None] = reactive(None)
-
-    def compose(self) -> ComposeResult:
-        with TabbedContent(initial="tab-ready") as tabs:
-            for label, _ in TAB_STATUSES:
-                with TabPane(label, id=f"tab-{label.lower()}"):
-                    yield DataTable(id=f"table-{label.lower()}", cursor_type="row")
-        self._tabs = tabs
-        self.border_title = "Tasks"
-
-    def watch_backend(self) -> None:
-        self._refresh_data()
-
-    def watch_queue_name(self) -> None:
-        self._refresh_data()
-
-    def refresh_tasks(self) -> None:
-        """Re-fetch and render tasks for the current queue and tab."""
-        self._refresh_data()
-
-    def compute_counts(self) -> dict[str, int]:
-        if self.telemetry is None or not self.queue_name:
-            return {label.lower(): 0 for label, _ in TAB_STATUSES}
-        counts = self.telemetry.queues[self.queue_name].counts
-        return {
-            label.lower(): getattr(counts, label.lower()) for label, _ in TAB_STATUSES
-        }
-
-    def watch_counts(self, counts: dict[str, int]) -> None:
-        for label, _status in TAB_STATUSES:
-            tab = self._tabs.get_tab(f"tab-{label.lower()}")
-            tab.label = f"{label} ({si_prefix(counts.get(label.lower(), 0))})"
-
-    def watch_selected_task(self, task: TaskResult | None) -> None:
-        if self.app._task_detail is not None:
-            self.app._task_detail.task_result = task
-
-    def on_mount(self) -> None:
-        """Configure per-status columns on first mount."""
-        for label, _ in TAB_STATUSES:
-            tab_id = label.lower()
-            table = self.query_one(f"#table-{tab_id}", DataTable)
-            table.add_columns(
-                *(COLUMN_LABELS[column] for column in TAB_COLUMNS[tab_id])
-            )
-            table.disabled = tab_id != "ready"
-
-    def switch_tab(self, tab_id: str) -> None:
-        """Activate the tab with the given id."""
-        self._tabs.active = tab_id
-
-    def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
-        """Notify the app when a task row is selected."""
-        if isinstance(event.row_key.value, str):
-            self._select_task_by_id(event.row_key.value)
-
-    def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
-        """Update the detail preview when a row is highlighted."""
-        if isinstance(event.row_key.value, str):
-            self._select_task_by_id(event.row_key.value)
-
-    def on_tabbed_content_tab_activated(
-        self, _event: TabbedContent.TabActivated
-    ) -> None:
-        """Refresh the visible table when the user switches tabs."""
-        self._refresh_data()
-
-    def _select_task_by_id(self, task_id: str) -> None:
-        """Find the task result matching the row key in the current results."""
-        self.selected_task = next(
-            (result for result in self._current_results if result.id == task_id),
-            None,
-        )
-
-    def _refresh_data(self) -> None:
-        """Fetch and display tasks for the current queue and active tab."""
-        backend = self.backend
-        queue_name = self.queue_name
-        if backend is None or not queue_name:
-            self._current_results = []
-            return
-        tab_id = self._tabs.active.removeprefix("tab-")
-        status = next(
-            (status for label, status in TAB_STATUSES if label.lower() == tab_id),
-            None,
-        )
-        for label, _ in TAB_STATUSES:
-            table = self.query_one(f"#table-{label.lower()}", DataTable)
-            table.clear()
-            table.disabled = label.lower() != tab_id
-        table = self.query_one(f"#table-{tab_id}", DataTable)
-        table.disabled = False
-        try:
-            self._current_results = list(
-                backend.peek(queue_name=queue_name, status=status, count=100)
-            )
-        except Exception:  # noqa: BLE001
-            logger.exception("Failed to peek tasks for %r", queue_name)
-            self._current_results = []
-        columns = TAB_COLUMNS[tab_id]
-        for result in self._current_results:
-            table.add_row(
-                *(_cell(result, column) for column in columns),
-                key=result.id,
-            )
-        self._restore_cursor(table)
-
-    def _restore_cursor(self, table: DataTable) -> None:
-        """Keep the highlighted task selected across a refresh, falling back to the first row."""
-        previous_id = self.selected_task.id if self.selected_task else None
-        row = next(
-            (
-                index
-                for index, result in enumerate(self._current_results)
-                if result.id == previous_id
-            ),
-            None,
-        )
-        if row is None:
-            row = 0 if self._current_results else None
-        if row is not None:
-            table.move_cursor(row=row)
-        self.selected_task = self._current_results[row] if row is not None else None
-
-
-class QueueList(ListView):
-    """List of queues for the selected backend with ingress/egress deltas."""
-
-    telemetry: reactive[BackendTelemetry | None] = reactive(None)
-
-    def __init__(self, **kwargs: Any) -> None:
-        super().__init__(**kwargs)
-        self._items: dict[str, QueueItem] = {}
-
-    def compose(self) -> ComposeResult:
-        yield from super().compose()
-        self.border_title = "Queues"
-
-    def watch_telemetry(self, telemetry: BackendTelemetry | None) -> None:
-        """Refresh queue labels when a new telemetry snapshot arrives."""
-        if telemetry is not None:
-            self.update_telemetry(telemetry)
-
-    def update_telemetry(self, telemetry: BackendTelemetry) -> None:
-        """Refresh queue labels from a new telemetry snapshot."""
-        queues = telemetry.queues
-        for queue_name, stats in sorted(queues.items()):
-            theme = BUILTIN_THEMES[self.app.theme]
-            rates = stats.rates
-            label = (
-                f"{queue_name:24}  "
-                f"[{theme.success}]+{si_prefix(rates.ingress):3}[/]  "
-                f"[{theme.error}]-{si_prefix(rates.egress):3}[/]"
-            )
-            if queue_name in self._items:
-                self._items[queue_name].children[0].update(label)
-            else:
-                item = QueueItem(queue_name, label)
-                self._items[queue_name] = item
-                self.append(item)
-        stale = [name for name in self._items if name not in queues]
-        for queue_name in stale:
-            self._items.pop(queue_name).remove()
-        if self.index is None and self._items:
-            target = (
-                DEFAULT_TASK_QUEUE_NAME
-                if DEFAULT_TASK_QUEUE_NAME in self._items
-                else next(iter(self._items))
-            )
-            self.index = list(self._items.keys()).index(target)
-            self._notify_selection(target)
-
-    def _notify_selection(self, queue_name: str) -> None:
-        """Tell the app which queue to display."""
-        self.app._task_list.queue_name = queue_name
 
 
 class InspectorApp(App):
@@ -347,6 +67,7 @@ class InspectorApp(App):
     BINDINGS = [
         Binding("q", "quit", "Quit"),
         Binding("f5", "refresh", "Refresh"),
+        Binding("v", "toggle_view", "Toggle Worker View"),
         *(
             Binding(key, f"switch_tab('tab-{tab_id}')", tab_id.capitalize())
             for tab_id, key in TAB_KEYS.items()
@@ -355,6 +76,10 @@ class InspectorApp(App):
 
     backend: reactive[ThreadmillTaskBackend] = reactive(None)
     telemetry: reactive[BackendTelemetry] = reactive(None, always_update=True)
+    worker_telemetry: reactive[WorkerTelemetry | None] = reactive(
+        None, always_update=True
+    )
+    worker_view_enabled: reactive[bool] = reactive(False)
 
     def __init__(
         self,
@@ -367,8 +92,11 @@ class InspectorApp(App):
         self._task_list: TaskList | None = None
         self._task_detail: TaskDetail | None = None
         self._options_static: Static | None = None
+        self._selection_tree: SelectionTree | None = None
+        self._worker_graphs: WorkerGraphs | None = None
         self._telemetry_timer = None
         self._auto_refresh = auto_refresh
+        self._node_cache: dict[str, NodeTelemetry] = {}
         self.set_reactive(InspectorApp.backend, backend)
 
     def compose(self) -> ComposeResult:
@@ -377,23 +105,35 @@ class InspectorApp(App):
         with Vertical(id="split-view"):
             with Horizontal(id="backend-row"):
                 yield Select(
-                    _supported_aliases(),
+                    list(_supported_aliases()),
                     id="backend-select",
                     value=self.backend.alias,
                     allow_blank=False,
                 )
                 yield Static(id="backend-options")
-            with Horizontal():
-                with Vertical(id="left-pane"):
+            with Horizontal(id="queue-view"):
+                with Vertical(classes="left-pane"):
                     yield QueueList(id="queue-list").data_bind(
                         telemetry=InspectorApp.telemetry
                     )
-                with Vertical(id="right-pane"):
+                with Vertical(classes="right-pane"):
                     yield TaskList(id="task-list").data_bind(
                         backend=InspectorApp.backend,
                         telemetry=InspectorApp.telemetry,
                     )
                     yield TaskDetail(id="task-detail", name="Task Detail")
+            with Horizontal(id="worker-view"):
+                with Vertical(classes="left-pane"):
+                    yield SelectionTree(
+                        "Worker Telemetry", id="selection-tree"
+                    ).data_bind(
+                        worker_telemetry=InspectorApp.worker_telemetry,
+                        queue_telemetry=InspectorApp.telemetry,
+                    )
+                with Vertical(classes="right-pane"):
+                    yield WorkerGraphs(id="worker-graphs").data_bind(
+                        worker_telemetry=InspectorApp.worker_telemetry,
+                    )
         yield Footer(show_command_palette=True)
 
     def on_mount(self) -> None:
@@ -403,14 +143,23 @@ class InspectorApp(App):
         self._task_list = self.query_one("#task-list", TaskList)
         self._task_detail = self.query_one("#task-detail", TaskDetail)
         self._options_static = self.query_one("#backend-options", Static)
+        self._selection_tree = self.query_one("#selection-tree", SelectionTree)
+        self._worker_graphs = self.query_one("#worker-graphs", WorkerGraphs)
         self._refresh_options()
         self._refresh_telemetry()
+        self.worker_telemetry = WorkerTelemetry(
+            nodes={},
+            queues={},
+            sampled_at=datetime.datetime.now(tz=datetime.UTC),
+        )
         if self._auto_refresh:
             self._telemetry_timer = self.set_interval(
                 TELEMETRY_INTERVAL_SECONDS,
                 self._refresh_telemetry,
                 name="telemetry-refresh",
             )
+            self.run_worker(self._subscribe_worker_telemetry, group="telemetry")
+        self._apply_worker_view_visibility()
         self._queue_list.focus()
 
     def action_quit(self) -> None:
@@ -425,6 +174,36 @@ class InspectorApp(App):
     def action_switch_tab(self, tab_id: str) -> None:
         """Activate the task status tab matching the given id."""
         self._task_list.switch_tab(tab_id)
+
+    def action_toggle_view(self) -> None:
+        """Switch between queue view and worker view."""
+        self.worker_view_enabled = not self.worker_view_enabled
+
+    def watch_worker_view_enabled(self, enabled: bool) -> None:
+        """Show/hide widgets and update the toggle binding label."""
+        self._apply_worker_view_visibility()
+        self._bindings.key_to_bindings["v"] = [
+            Binding(
+                "v",
+                "toggle_view",
+                "Toggle Queue View" if enabled else "Toggle Worker View",
+            )
+        ]
+        self.refresh_bindings()
+
+    def _apply_worker_view_visibility(self) -> None:
+        """Toggle between queue view and worker view."""
+        self.query_one("#queue-view").display = not self.worker_view_enabled
+        self.query_one("#worker-view").display = self.worker_view_enabled
+        if self.worker_view_enabled:
+            self._selection_tree.focus()
+        else:
+            self._queue_list.focus()
+
+    def on_tree_node_selected(self, event: Tree.NodeSelected) -> None:
+        """Update worker graphs when a tree node is selected."""
+        if event.node.data is not None and isinstance(event.node.data, WorkerTreeNode):
+            self._worker_graphs.selection = event.node.data
 
     def watch_backend(self) -> None:
         self._refresh_options()
@@ -456,8 +235,50 @@ class InspectorApp(App):
         self._options_static.update(" ".join(parts) or "No options")
 
     def _refresh_telemetry(self) -> None:
-        """Poll the backend for fresh telemetry."""
+        """Poll backend for queue telemetry and rebuild the worker view."""
         try:
             self.telemetry = self.backend.telemetry()
         except Exception:  # noqa: BLE001
             logger.exception("Failed to refresh telemetry")
+        if self._node_cache:
+            self.worker_telemetry = self._build_worker_telemetry()
+
+    def _build_worker_telemetry(self) -> WorkerTelemetry:
+        """Build a snapshot from the latest per-host node cache."""
+        queues: dict[str, set[str]] = {}
+        for node in self._node_cache.values():
+            for queue_name in node.queues:
+                queues.setdefault(queue_name, set()).add(node.hostname)
+        return WorkerTelemetry(
+            nodes=dict(self._node_cache),
+            queues={name: tuple(sorted(hosts)) for name, hosts in queues.items()},
+            sampled_at=datetime.datetime.now(tz=datetime.UTC),
+        )
+
+    async def _subscribe_worker_telemetry(self) -> None:
+        """Maintain a pub/sub subscription; cache the latest snapshot per host.
+
+        Each message updates the per-host cache silently; the reactive
+        `worker_telemetry` is only rebuilt on the 2-second timer tick
+        (`_refresh_telemetry`) to avoid flooding the UI with redraws.
+        """
+        from ..backends.redis import WORKER_TELEMETRY_TTL as _TTL
+
+        try:
+            async for snapshot in self.backend.subscribe_worker_telemetry():
+                for hostname, node in snapshot.nodes.items():
+                    self._node_cache[hostname] = node
+                self._prune_nodes(_TTL)
+        except Exception:  # noqa: BLE001
+            logger.exception("Worker telemetry subscription failed")
+
+    def _prune_nodes(self, ttl_seconds: int) -> None:
+        """Drop cached nodes whose latest sample is older than the TTL."""
+        cutoff = datetime.datetime.now(tz=datetime.UTC) - datetime.timedelta(
+            seconds=ttl_seconds
+        )
+        self._node_cache = {
+            hostname: node
+            for hostname, node in self._node_cache.items()
+            if node.sampled_at > cutoff
+        }

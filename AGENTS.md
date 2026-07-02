@@ -18,7 +18,7 @@ uv run pytest -m "integration and benchmark"
 uv run pytest --benchmark-compare          # compare vs main baseline (run main first)
 uvx prek run --all-files
 uv run manage.py threadmill worker         # run the worker pool
-uv run manage.py threadmill inspector    # launch the textual TUI inspector
+uv run manage.py threadmill inspector      # launch the textual TUI inspector
 ```
 
 CI additionally pins Django per matrix step: `uv run --with django~=6.1a1 pytest -m "not benchmark"`.
@@ -28,8 +28,8 @@ Run a single test by node ID, e.g. `uv run pytest tests/test_command.py::TestCom
 ## Setup
 
 - Install pre-commit hooks before first commit: `uvx prek install` (not `pre-commit install`).
-- `DJANGO_SETTINGS_MODULE=tests.testapp.settings` is already set in `.env` and in `pyproject.toml`. Pytest auto-loads it.
-- CI's Linux job starts a Redis service and sets `REDIS_URL`; some integration tests may rely on it. Local runs of `-m integration` may need Redis if a backend test targets it.
+- `DJANGO_SETTINGS_MODULE=tests.testapp.settings` is set in `.env` and `pyproject.toml`; pytest auto-loads it.
+- CI's Linux job starts Redis and sets `REDIS_URL`; some integration tests rely on it. Local `-m integration` runs may need Redis.
 
 ## Code & style (repo-specific, beyond PEP 8)
 
@@ -50,15 +50,15 @@ Codecov requires 100% patch coverage on PRs (`pyproject.toml`, `.codecov.yml`). 
 
 ## Architecture notes
 
-- Entry point for end users: `threadmill/management/commands/threadmill.py` (Django management command with `worker` and `inspector` subcommands).
+- Entry point: `threadmill/management/commands/threadmill.py` (management command with `worker` and `inspector` subcommands).
 - Core runtime: `threadmill/executor.py` (`TaskExecutor`) — process/thread pool, graceful shutdown, worker recycling, task timeout/backlog.
-- Integration point for queue authors: `threadmill/backends.py` (`AcknowledgeableTaskBackend`) — subclasses implement `acquire` (lock-without-remove) and `acknowledge` (remove + publish). Requires late-ack support from the underlying queue.
+- Queue author integration point: `threadmill/backends/base.py` (`ThreadmillTaskBackend`) — subclasses implement `acquire` (lock-without-remove) and `acknowledge` (remove + publish); requires late-ack support from the underlying queue.
 - Test app backend `tests/testapp/backends.py` (`GeneratingTaskBackend`) generates tasks in-process for benchmarks; reset between runs via `default_task_backend.reset()`.
 
 ## Pre-commit
 
-`.pre-commit-config.yaml` runs ruff (check + format), django-upgrade, pyupgrade, mdformat (excludes `.github/agents/`), yamlfmt, and `no-commit-to-branch` (protects `main`). Hooks auto-fix; ruff is configured `--exit-non-zero-on-fix`, so commit any fixes before pushing.
+`.pre-commit-config.yaml` runs ruff (check + format), django-upgrade, pyupgrade, mdformat (excludes `.github/agents/`), yamlfmt, and `no-commit-to-branch` (protects `main`). Hooks auto-fix; ruff uses `--exit-non-zero-on-fix`, so commit fixes before pushing.
 
 ## PR / release
 
-CI runs on `main` pushes and PRs. Releases are published to PyPI via `.github/workflows/release.yml` on GitHub release. Commits to `main` are blocked by `no-commit-to-branch`; work on a branch.
+CI runs on `main` pushes and PRs. Releases publish to PyPI via `.github/workflows/release.yml` on GitHub release. `no-commit-to-branch` blocks commits to `main`; work on a branch.

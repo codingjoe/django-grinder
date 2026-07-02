@@ -15,35 +15,21 @@ curl -sSL https://raw.githubusercontent.com/codingjoe/naming-things/refs/heads/m
 
 ## Testing
 
-We have unit tests, integration tests, and benchmarks. Avoid mocking if possible.
-
-To run the tests, use the following command:
+The suite has unit tests, integration tests, and benchmarks. Avoid mocking where possible.
 
 ```bash
-uv run pytest
-```
-
-To run only integration tests:
-
-```bash
-uv run pytest -m integration
-```
-
-To run only integration benchmarks:
-
-```bash
+uv run pytest                              # full suite
+uv run pytest -m integration               # integration tests only
 uv run pytest -m "integration and benchmark"
 ```
 
-Benchmarking snapshots are created automatically.
-To compare your feature branch against the main branch,
-run the test suite on main, followed by:
+Benchmark snapshots are created automatically. To compare a feature branch against main, run the suite on main first, then:
 
 ```
 uv run pytest --benchmark-compare
 ```
 
-Before your first commit, ensure that the pre-commit hooks are installed by running:
+Install pre-commit hooks before your first commit:
 
 ```bash
 uvx prek install

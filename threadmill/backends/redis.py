@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import dataclasses
 import datetime
+import json
 import logging
 import queue
 import time
+import typing
 import uuid
 from collections.abc import Generator, Sequence
 from pathlib import Path
@@ -19,10 +22,12 @@ from django.utils import timezone
 from threadmill.backends.base import (
     BackendTelemetry,
     Broker,
+    NodeTelemetry,
     QueueCounts,
     QueueRates,
     QueueStats,
     ThreadmillTaskBackend,
+    WorkerTelemetry,
 )
 
 logger = logging.getLogger(__name__)
@@ -31,7 +36,7 @@ _LUA_DIR = Path(__file__).resolve().parent / "lua"
 
 
 def _load_lua(name: str) -> str:
-    """Load a Lua script from the lua directory."""
+    """Load a Lua script by name."""
     return (_LUA_DIR / f"{name}.lua").read_text()
 
 
@@ -111,6 +116,10 @@ class RedisBroker(Broker):
                 logger.exception("Telemetry trim error for queue %r", queue_name)
 
 
+WORKER_TELEMETRY_CHANNEL = "{prefix}:worker-telemetry"
+WORKER_TELEMETRY_TTL = 10  # seconds before stale entries are pruned
+
+
 class RedisTaskBackend(ThreadmillTaskBackend):
     """Redis-backed durable priority queue backend.
 
@@ -149,6 +158,7 @@ class RedisTaskBackend(ThreadmillTaskBackend):
             raise ValueError(
                 f"REDIS_URL must be specified in your settings for the {type(self).__name__}."
             ) from e
+        self.redis_url = redis_url
         self.client = redis.from_url(redis_url)
         self.key_prefix = f"threadmill:{{{alias}}}"
         self.lease_ttl = self.options.get("lease_ttl", datetime.timedelta(hours=1))
@@ -464,6 +474,69 @@ class RedisTaskBackend(ThreadmillTaskBackend):
             )
         return BackendTelemetry(queues=queues)
 
+    def publish_worker_telemetry(self, telemetry: WorkerTelemetry) -> None:
+        channel = WORKER_TELEMETRY_CHANNEL.format(prefix=self.key_prefix)
+        self.client.publish(channel, _serialize_worker_telemetry(telemetry))
+
+    async def subscribe_worker_telemetry(self) -> typing.AsyncIterator[WorkerTelemetry]:
+        import redis.asyncio as aioredis
+
+        redis_url = self.redis_url
+        channel = WORKER_TELEMETRY_CHANNEL.format(prefix=self.key_prefix)
+        async with aioredis.from_url(redis_url) as client:
+            pubsub = client.pubsub()
+            await pubsub.subscribe(channel)
+            try:
+                while True:
+                    message = await pubsub.get_message(
+                        timeout=1.0, ignore_subscribe_messages=True
+                    )
+                    if message is None:
+                        continue
+                    payload = message["data"]
+                    if isinstance(payload, bytes):
+                        payload = payload.decode()
+                    yield _deserialize_worker_telemetry(payload)
+            finally:
+                await pubsub.unsubscribe(channel)
+                await pubsub.aclose()
+
     def close(self) -> None:
         """Close the Redis connection."""
         self.client.close()
+
+
+def _serialize_worker_telemetry(telemetry: WorkerTelemetry) -> str:
+    """Serialize a worker telemetry snapshot to JSON."""
+    return json.dumps(dataclasses.asdict(telemetry), default=lambda o: o.isoformat())
+
+
+def _deserialize_worker_telemetry(payload: str) -> WorkerTelemetry:
+    """Deserialize a JSON payload into a worker telemetry snapshot."""
+    data = json.loads(payload)
+    nodes = {
+        hostname: _deserialize_node(node_data)
+        for hostname, node_data in data.get("nodes", {}).items()
+    }
+    queues = {
+        queue_name: tuple(hostnames)
+        for queue_name, hostnames in data.get("queues", {}).items()
+    }
+    sampled_at = datetime.datetime.fromisoformat(data["sampled_at"])
+    return WorkerTelemetry(nodes=nodes, queues=queues, sampled_at=sampled_at)
+
+
+def _deserialize_node(data: dict) -> NodeTelemetry:
+    """Deserialize a JSON dict into a node telemetry snapshot."""
+    return NodeTelemetry(
+        hostname=data["hostname"],
+        pid=data["pid"],
+        queues=tuple(data.get("queues", [])),
+        process_count=data["process_count"],
+        thread_count=data["thread_count"],
+        cpu_percent=data["cpu_percent"],
+        memory_bytes=data["memory_bytes"],
+        memory_total=data["memory_total"],
+        tasks_per_minute=data["tasks_per_minute"],
+        sampled_at=datetime.datetime.fromisoformat(data["sampled_at"]),
+    )

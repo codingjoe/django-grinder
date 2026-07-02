@@ -23,6 +23,8 @@ from django.tasks.signals import task_finished, task_started
 from django.utils import timezone
 from django.utils.json import normalize_json
 
+from .telemetry import TelemetrySampler
+
 if typing.TYPE_CHECKING:
     from .backends.base import Broker, ThreadmillTaskBackend
 
@@ -38,7 +40,7 @@ logger.setLevel(logging.INFO)
 
 @dataclasses.dataclass(kw_only=True, slots=True)
 class TaskExecutor:
-    """Tasks consumed from shared joinable queues via process and thread pools."""
+    """Pool of processes and threads consuming tasks from shared joinable queues."""
 
     backend: ThreadmillTaskBackend
     workers: int | None = None
@@ -54,11 +56,17 @@ class TaskExecutor:
     queues: tuple[str]
     broker: Broker | None = dataclasses.field(default=None, init=False)
     exit_empty: bool = False
+    total_counter: multiprocessing.Value = dataclasses.field(init=False)
+    telemetry_sampler: TelemetrySampler | None = dataclasses.field(
+        default=None, init=False
+    )
 
     def __post_init__(self) -> None:
-        """Initialize derived orchestration fields and queues."""
         self.process_count = self.workers or max(multiprocessing.cpu_count() - 1, 1)
         self.thread_count = max(self.threads, 1)
+        # Shared aggregate task counter; created before workers fork so each
+        # worker process inherits the same value for throughput telemetry.
+        self.total_counter = multiprocessing.Value("q", 0)
 
     def get_maximum_tasks_per_child(self) -> int | None:
         """Return worker recycling limit based on config and thread count."""
@@ -75,6 +83,7 @@ class TaskExecutor:
             self.backend.alias,
             self.queues,
             self.exit_empty,
+            total_counter=self.total_counter,
         )
         worker.start()
         return worker
@@ -90,6 +99,8 @@ class TaskExecutor:
         if self.backend.broker_class:
             self.broker = self.backend.broker_class(self.backend)
             threads.append(self.broker)
+        self.telemetry_sampler = TelemetrySampler(self.backend, executor=self)
+        self.telemetry_sampler.start()
 
         for thread in threads:
             thread.start()
@@ -101,6 +112,8 @@ class TaskExecutor:
         logger.info("Shutting down task executor")
         if self.broker is not None:
             self.broker.shutdown()
+        if self.telemetry_sampler is not None:
+            self.telemetry_sampler.stop()
         with ThreadPoolExecutor(max_workers=self.process_count) as executor:
             executor.map(lambda worker: worker.shutdown(), self.worker_processes)
         self.is_publishing = False
@@ -133,6 +146,8 @@ class WorkerProcess(multiprocessing.Process):
         backend_alias: str = "",
         queues: tuple[str, ...] = (),
         exit_empty: bool = False,
+        *,
+        total_counter: multiprocessing.Value,
     ) -> None:
         """Create process with dedicated thread pool for task execution."""
         self.shutdown_requested = multiprocessing.Event()
@@ -143,6 +158,7 @@ class WorkerProcess(multiprocessing.Process):
         self.queues = queues
         self.exit_empty = exit_empty
         self.task_count = 0
+        self.total_counter = total_counter
         self.lock: threading.Lock | None = None
         self.expired: threading.Event | None = None
 
@@ -164,7 +180,10 @@ class WorkerProcess(multiprocessing.Process):
             )
 
     def record_task(self) -> None:
-        """Record one processed task and stop when max_tasks is reached."""
+        """Record one processed task and recycle the process at max_tasks."""
+        # Always count towards the executor's aggregate throughput counter.
+        with self.total_counter.get_lock():
+            self.total_counter.value += 1
         if self.max_tasks is None:
             return
         if self.lock is None or self.expired is None:
@@ -217,7 +236,7 @@ class WorkerThread(threading.Thread):
                 self.worker.record_task()
 
     def execute_task_result(self, task_result: TaskResult) -> TaskResult:
-        """Execute task from task result and update result lifecycle state."""
+        """Execute the wrapped task and update result lifecycle state."""
         logger.info("Executing task %r", task_result.id)
         started_at = timezone.now()
         task_result = dataclasses.replace(
