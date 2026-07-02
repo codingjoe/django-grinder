@@ -238,6 +238,7 @@ class WorkerThread(threading.Thread):
                 finished_at=timezone.now(),
             )
             logger.exception("Task failed %r", task_result.id)
+            self.retry(task_result)
         else:
             task_result = dataclasses.replace(
                 task_result,
@@ -252,6 +253,22 @@ class WorkerThread(threading.Thread):
             task_finished.send(TaskExecutor, task_result=task_result)
 
         return task_result
+
+    def retry(self, task_result: TaskResult) -> None:
+        """Schedule a retry for a failed task if a retry function is configured."""
+        retry_fn = getattr(task_result.task.func, "retry_fn", None)
+        if retry_fn is None:
+            return
+        delay = retry_fn(TaskContext(task_result=task_result))
+        if delay is None:
+            return
+        run_after = timezone.now() + delay
+        self.backend.enqueue(
+            task_result.task.using(run_after=run_after),
+            task_result.args,
+            task_result.kwargs,
+        )
+        logger.info("Task %r scheduled for retry at %s", task_result.id, run_after)
 
     @staticmethod
     def call_task(task_result: TaskResult) -> typing.Any:
