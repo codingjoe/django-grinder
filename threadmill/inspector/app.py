@@ -262,13 +262,11 @@ class InspectorApp(App):
         `worker_telemetry` is only rebuilt on the 2-second timer tick
         (`_refresh_telemetry`) to avoid flooding the UI with redraws.
         """
-        from ..backends.redis import WORKER_TELEMETRY_TTL as _TTL
-
         try:
             async for snapshot in self.backend.subscribe_worker_telemetry():
                 for hostname, node in snapshot.nodes.items():
                     self._node_cache[hostname] = node
-                self._prune_nodes(_TTL)
+                self._prune_nodes(10)
         except Exception:  # noqa: BLE001
             logger.exception("Worker telemetry subscription failed")
 

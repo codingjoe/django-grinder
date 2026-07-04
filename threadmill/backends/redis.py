@@ -116,10 +116,6 @@ class RedisBroker(Broker):
                 logger.exception("Telemetry trim error for queue %r", queue_name)
 
 
-WORKER_TELEMETRY_CHANNEL = "{prefix}:worker-telemetry"
-WORKER_TELEMETRY_TTL = 10  # seconds before stale entries are pruned
-
-
 class RedisTaskBackend(ThreadmillTaskBackend):
     """Redis-backed durable priority queue backend.
 
@@ -143,6 +139,7 @@ class RedisTaskBackend(ThreadmillTaskBackend):
     SUCCESSFUL_RESULTS_KEY = "{prefix}:results:{queue_name}:successful"
     FAILED_RESULTS_KEY = "{prefix}:results:{queue_name}:failed"
     INGRESS_KEY = "{prefix}:ingress:{queue_name}:events"
+    WORKER_TELEMETRY_CHANNEL = "{prefix}:worker-telemetry"
 
     ACQUIRE_SCRIPT = _load_lua("acquire")
     """Pop the next task from a priority queue and move it directly to the running set."""
@@ -475,14 +472,14 @@ class RedisTaskBackend(ThreadmillTaskBackend):
         return BackendTelemetry(queues=queues)
 
     def publish_worker_telemetry(self, telemetry: WorkerTelemetry) -> None:
-        channel = WORKER_TELEMETRY_CHANNEL.format(prefix=self.key_prefix)
+        channel = self.WORKER_TELEMETRY_CHANNEL.format(prefix=self.key_prefix)
         self.client.publish(channel, _serialize_worker_telemetry(telemetry))
 
     async def subscribe_worker_telemetry(self) -> typing.AsyncIterator[WorkerTelemetry]:
         import redis.asyncio as aioredis
 
         redis_url = self.redis_url
-        channel = WORKER_TELEMETRY_CHANNEL.format(prefix=self.key_prefix)
+        channel = self.WORKER_TELEMETRY_CHANNEL.format(prefix=self.key_prefix)
         async with aioredis.from_url(redis_url) as client:
             pubsub = client.pubsub()
             await pubsub.subscribe(channel)

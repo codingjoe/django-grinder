@@ -74,15 +74,7 @@ class BackendTelemetry:
 
 @dataclasses.dataclass(kw_only=True, slots=True)
 class NodeTelemetry:
-    """Telemetry for a single node (host) running a worker pool.
-
-    The executor's telemetry sampler publishes one snapshot per node with
-    system-level CPU/memory sampled via `psutil` and the executor's
-    process/thread counts. `memory_bytes` is physical RAM in use and
-    `memory_total` is the machine's total physical RAM; swap is tracked
-    separately by `psutil.swap_memory()` and is deliberately excluded.
-    The inspector derives the usage percentage from these two values.
-    """
+    """Telemetry for a single node (host) running a worker pool."""
 
     hostname: str
     pid: int
@@ -98,13 +90,7 @@ class NodeTelemetry:
 
 @dataclasses.dataclass(kw_only=True, slots=True)
 class WorkerTelemetry:
-    """Snapshot of worker pool health across a backend's queues and nodes.
-
-    `nodes` is keyed by hostname and carries system-level CPU/mem plus
-    per-process counters. `queues` maps each queue name to the hostnames
-    listening on it, so the inspector can render a Queue -> Node selection
-    tree.
-    """
+    """Snapshot of worker pool health across a backend's queues and nodes."""
 
     nodes: dict[str, NodeTelemetry]
     queues: dict[str, tuple[str, ...]]

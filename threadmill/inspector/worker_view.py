@@ -51,12 +51,7 @@ class SelectionTree(Tree[WorkerTreeNode]):
             self.update_telemetry()
 
     def update_telemetry(self) -> None:
-        """Rebuild the tree from the latest telemetry, preserving the cursor.
-
-        Every defined queue is shown (labelled with the number of nodes
-        draining it), even when no node is listening on it. The tree is only
-        rebuilt when the set of (queue, hostname) pairs changes.
-        """
+        """Rebuild the tree from the latest telemetry, preserving the cursor."""
         worker = self.worker_telemetry
         queues = self.queue_telemetry
         if worker is None or queues is None:
