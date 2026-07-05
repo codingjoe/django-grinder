@@ -1,9 +1,11 @@
 import asyncio
+import datetime
 import logging
 import random
 import uuid
 
 from django.tasks import task
+from django.tasks.base import TaskContext
 
 logger = logging.getLogger(__name__)
 
@@ -65,3 +67,49 @@ def random_crash():
     """Raise a random exception."""
     if random.random() < 0.75:  # noqa: S311
         exit(1)
+
+
+def retry_always(context: TaskContext) -> datetime.timedelta:
+    """Retry with a fixed 1-second delay."""
+    return datetime.timedelta(seconds=1)
+
+
+def retry_never(context: TaskContext) -> datetime.timedelta | None:
+    """Never retry — always return None."""
+    return None
+
+
+def retry_thrice(context: TaskContext) -> datetime.timedelta | None:
+    """Retry up to 3 attempts, then stop."""
+    if context.attempt >= 3:
+        return None
+    return datetime.timedelta(seconds=1)
+
+
+def retry_raise(context: TaskContext) -> datetime.timedelta | None:
+    """Raise an exception to test retry callback error handling."""
+    raise RuntimeError("retry callback crashed")
+
+
+@task(retry=retry_always)
+def boom_with_retry():
+    """Raise ValueError, but always schedule a retry."""
+    raise ValueError("boom")
+
+
+@task(retry=retry_never)
+def boom_no_retry():
+    """Raise ValueError, retry callback returns None."""
+    raise ValueError("boom")
+
+
+@task(retry=retry_thrice)
+def boom_retry_thrice():
+    """Raise ValueError, retry up to 3 attempts."""
+    raise ValueError("boom")
+
+
+@task(retry=retry_raise)
+def boom_retry_raises():
+    """Raise ValueError, retry callback itself raises."""
+    raise ValueError("boom")

@@ -11,7 +11,9 @@ import django
 from django.core.serializers.json import DjangoJSONEncoder
 from django.tasks import DEFAULT_TASK_QUEUE_NAME, Task, TaskResult, TaskResultStatus
 from django.tasks.backends.base import BaseTaskBackend
-from django.tasks.base import TaskError
+from django.tasks.base import TaskContext, TaskError
+from django.tasks.exceptions import InvalidTask
+from django.utils.inspect import is_module_level_function
 from django.utils.module_loading import import_string
 
 if django.VERSION == (6, 0):
@@ -34,6 +36,44 @@ if django.VERSION == (6, 0):
             kwargs["func"] = self.module_path
 
             return (self.__class__._reconstruct, (kwargs,))
+
+
+@dataclasses.dataclass(frozen=True, slots=True, kw_only=True)
+class RetryTask(Task):
+    """Task with an optional retry callback for backoff scheduling.
+
+    Usage:
+
+        def retry_callback(context: TaskContext) -> datetime.timedelta | None:
+            if context.attempt < 3:
+                return datetime.timedelta(seconds=60 * (2 ** context.attempt))
+
+        @task(retry=retry_callback)
+        def my_task():
+            ...
+
+    """
+
+    retry: collections.abc.Callable[[TaskContext], datetime.timedelta | None] | None = (
+        None
+    )
+
+    @property
+    def retry_path(self) -> str | None:
+        """Importable dotted path of the retry callback, or None."""
+        if self.retry:
+            return f"{self.retry.__module__}.{self.retry.__qualname__}"
+
+    @classmethod
+    def _reconstruct(cls, kwargs):
+        if retry_path := kwargs.pop("retry", None):
+            kwargs["retry"] = import_string(retry_path)
+        return super()._reconstruct(kwargs)
+
+    def __reduce__(self):
+        reconstructor, (kwargs,) = super().__reduce__()
+        kwargs["retry"] = self.retry_path
+        return (reconstructor, (kwargs,))
 
 
 @dataclasses.dataclass(kw_only=True, slots=True)
@@ -116,19 +156,20 @@ class TaskResultEncoder(DjangoJSONEncoder):
                 field.name: getattr(o, field.name)
                 for field in dataclasses.fields(type(o))
             }
-        if isinstance(o, Task):
-            return {
+        if isinstance(o, RetryTask):
+            data = {
                 field.name: getattr(o, field.name)
-                for field in dataclasses.fields(Task)
-                if field.name != "func"  # Exclude the function object itself
-            } | {"func": o.module_path}
+                for field in dataclasses.fields(RetryTask)
+                if field.name not in {"func", "retry"}
+            } | {"func": o.module_path, "retry": o.retry_path}
+            return data
         return super().default(o)
 
 
 class ThreadmillTaskBackend(BaseTaskBackend, ABC):
     """Interface for task queues to be processed by the executor."""
 
-    task_class = Task  # can be removed in the future when Django 6.0 support is dropped
+    task_class = RetryTask
     supports_async_task = True
     supports_get_result = True
     broker_class: type[Broker] | None = None
@@ -144,18 +185,8 @@ class ThreadmillTaskBackend(BaseTaskBackend, ABC):
         def _object_hook(d: dict) -> dict | TaskResult:
             if "task" in d and isinstance(d["task"], dict) and "func" in d["task"]:
                 task_data = d["task"]
-                func = import_string(task_data["func"])
-                if isinstance(func, cls.task_class):
-                    func = func.func
-                d["task"] = cls.task_class(
-                    func=func,
-                    **{
-                        field.name: _parse_datetime(task_data[field.name])
-                        for field in dataclasses.fields(cls.task_class)
-                        if field.name not in {"func", "takes_context"}
-                        and field.name in task_data
-                    },
-                )
+                task_data["run_after"] = _parse_datetime(task_data["run_after"])
+                d["task"] = cls.task_class._reconstruct(task_data)
                 d["status"] = TaskResultStatus(d["status"])
                 d["errors"] = [TaskError(**error) for error in d["errors"]]
                 return_value = d.pop("_return_value", None)
@@ -167,6 +198,13 @@ class ThreadmillTaskBackend(BaseTaskBackend, ABC):
             return d
 
         return json.loads(data, object_hook=_object_hook)
+
+    def validate_task(self, task: RetryTask) -> None:
+        super().validate_task(task)
+        if task.retry is not None and not is_module_level_function(task.retry):
+            raise InvalidTask(
+                "Task's retry function must be defined at a module level."
+            )
 
     def acquire(
         self,
@@ -192,6 +230,10 @@ class ThreadmillTaskBackend(BaseTaskBackend, ABC):
         """Remove the task from the queue and publish the result."""
         raise NotImplementedError
 
+    def requeue(self, task_result: TaskResult, run_after: datetime.datetime) -> None:
+        """Re-queue a failed task result for a retry attempt after `run_after`."""
+        raise NotImplementedError
+
     def peek(
         self,
         queue_name: str = DEFAULT_TASK_QUEUE_NAME,
@@ -200,7 +242,7 @@ class ThreadmillTaskBackend(BaseTaskBackend, ABC):
         count: int = 1,
     ) -> collections.abc.Generator[TaskResult, None, None]:
         """
-        Yield up to ``count`` tasks from a queue in the given status segment.
+        Yield up to `count` tasks from a queue in the given status segment.
 
         Args:
             queue_name: The name of the queue to peek into.
