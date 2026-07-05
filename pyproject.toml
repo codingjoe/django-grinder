@@ -40,6 +40,10 @@ dependencies = ["django>=6.0"]
 redis = ["redis>=5.0"]
 inspector = [
     "textual>=8.2.7",
+    "textual-plotext>=1.0.1",
+]
+worker = [
+    "psutil>=7.2.2",
 ]
 
 [project.urls]

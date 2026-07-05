@@ -5,6 +5,7 @@ import dataclasses
 import datetime
 import json
 import threading
+import typing
 from abc import ABC
 
 import django
@@ -49,7 +50,7 @@ class QueueCounts:
 
 @dataclasses.dataclass(kw_only=True, slots=True)
 class QueueRates:
-    """Rolling ingress/egress throughput over a time window (time-series data)."""
+    """Rolling ingress/egress throughput over a time window."""
 
     interval: datetime.timedelta
     ingress: int
@@ -69,6 +70,31 @@ class BackendTelemetry:
     """Snapshot of counts and rates across a backend's queues."""
 
     queues: dict[str, QueueStats]
+
+
+@dataclasses.dataclass(kw_only=True, slots=True)
+class NodeTelemetry:
+    """Telemetry for a single node (host) running a worker pool."""
+
+    hostname: str
+    pid: int
+    queues: tuple[str, ...]
+    process_count: int
+    thread_count: int
+    cpu_percent: float
+    memory_bytes: int
+    memory_total: int
+    tasks_per_minute: float
+    sampled_at: datetime.datetime
+
+
+@dataclasses.dataclass(kw_only=True, slots=True)
+class WorkerTelemetry:
+    """Snapshot of worker pool health across a backend's queues and nodes."""
+
+    nodes: dict[str, NodeTelemetry]
+    queues: dict[str, tuple[str, ...]]
+    sampled_at: datetime.datetime
 
 
 class Broker(threading.Thread):
@@ -200,7 +226,7 @@ class ThreadmillTaskBackend(BaseTaskBackend, ABC):
         count: int = 1,
     ) -> collections.abc.Generator[TaskResult, None, None]:
         """
-        Yield up to ``count`` tasks from a queue in the given status segment.
+        Yield up to `count` tasks from a queue in the given status segment.
 
         Args:
             queue_name: The name of the queue to peek into.
@@ -218,3 +244,36 @@ class ThreadmillTaskBackend(BaseTaskBackend, ABC):
             interval: The time window for rolling rates.
         """
         raise NotImplementedError
+
+    def publish_worker_telemetry(self, telemetry: WorkerTelemetry) -> None:
+        """Publish a worker-pool telemetry snapshot to a shared store.
+
+        Backends without a shared store implement this as a no-op so the
+        worker command still runs without worker telemetry.
+        """
+
+    def worker_telemetry(self) -> WorkerTelemetry:
+        """Return the latest worker-pool telemetry snapshot, or an empty one.
+
+        Backends without a shared store return an empty snapshot so the
+        inspector can render the worker view without raising.
+        """
+        return WorkerTelemetry(
+            nodes={},
+            queues={},
+            sampled_at=datetime.datetime.now(tz=datetime.UTC),
+        )
+
+    async def subscribe_worker_telemetry(self) -> typing.AsyncIterator[WorkerTelemetry]:
+        """Yield worker telemetry snapshots as they arrive.
+
+        Backends with pub/sub capability override this to maintain a
+        persistent subscription.  The default implementation yields a
+        single empty snapshot and stops, so non-Redis backends still
+        compile and the inspector can fall back to polling.
+        """
+        yield WorkerTelemetry(
+            nodes={},
+            queues={},
+            sampled_at=datetime.datetime.now(tz=datetime.UTC),
+        )
