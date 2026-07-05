@@ -1000,24 +1000,33 @@ class TestWorkerNodeCache:
         assert len(app._node_cache) == 1
         assert app._node_cache["node-1"].pid == 200
 
-    def test_prune_drops_stale_nodes(self):
-        """_prune_nodes drops entries older than the TTL."""
+    def test_push_evicts_oldest_host_when_cache_is_full(self):
+        """Pushing beyond the cache cap evicts the least-recently-updated host."""
         app = InspectorApp(
             backend=_StubBackend(alias="default", params={}), auto_refresh=False
         )
-        old = datetime.datetime.now(tz=datetime.UTC) - datetime.timedelta(seconds=20)
-        app._node_cache["node-1"] = dataclasses.replace(_make_node(), sampled_at=old)
-        app._prune_nodes(10)
+        app._node_cache.maxlen = 2
+        app._node_cache["node-1"] = _make_node(hostname="node-1")
+        app._node_cache["node-2"] = _make_node(hostname="node-2")
+        app._node_cache["node-3"] = _make_node(hostname="node-3")
+        assert len(app._node_cache) == 2
         assert "node-1" not in app._node_cache
+        assert "node-2" in app._node_cache
+        assert "node-3" in app._node_cache
 
-    def test_prune_keeps_fresh_nodes(self):
-        """_prune_nodes retains entries within the TTL window."""
+    def test_push_for_existing_host_marks_it_most_recent(self):
+        """Re-pushing an existing host keeps it and evicts the oldest other host."""
         app = InspectorApp(
             backend=_StubBackend(alias="default", params={}), auto_refresh=False
         )
-        app._node_cache["node-1"] = _make_node()
-        app._prune_nodes(10)
-        assert "node-1" in app._node_cache
+        app._node_cache.maxlen = 2
+        app._node_cache["node-1"] = _make_node(hostname="node-1")
+        app._node_cache["node-2"] = _make_node(hostname="node-2")
+        # Refresh node-1 so node-2 becomes the oldest entry.
+        app._node_cache["node-1"] = _make_node(hostname="node-1", pid=999)
+        app._node_cache["node-3"] = _make_node(hostname="node-3")
+        assert set(app._node_cache) == {"node-1", "node-3"}
+        assert app._node_cache["node-1"].pid == 999
 
     def test_build_includes_nodes_and_queue_index(self):
         """_build_worker_telemetry returns cached nodes plus a queue->host index."""

@@ -41,12 +41,10 @@ class SelectionTree(Tree[WorkerTreeNode]):
         self.show_root = False
 
     def watch_worker_telemetry(self, telemetry: WorkerTelemetry | None) -> None:
-        """Rebuild the tree when a new worker telemetry snapshot arrives."""
         if telemetry is not None:
             self.update_telemetry()
 
     def watch_queue_telemetry(self, telemetry: BackendTelemetry | None) -> None:
-        """Rebuild the tree when the set of defined queues changes."""
         if telemetry is not None:
             self.update_telemetry()
 
@@ -117,8 +115,7 @@ class SelectionTree(Tree[WorkerTreeNode]):
 class WorkerGraphs(Static):
     """Throughput/CPU/memory graphs for the worker view."""
 
-    # 60 s of data at a 2 s sample interval = 30 data points.
-    GRAPH_HISTORY_SIZE = 30
+    GRAPH_HISTORY_SIZE = 60  # one minute of 1-second samples
     worker_telemetry: reactive[WorkerTelemetry | None] = reactive(None)
     selection: reactive[WorkerTreeNode | None] = reactive(None)
 
@@ -143,12 +140,10 @@ class WorkerGraphs(Static):
         yield Sparkline(id="worker-memory-graph", data=list(self._memory_history))
 
     def watch_selection(self) -> None:
-        """Reset histories when the selection changes."""
         self._reset_histories()
         self._refresh_graphs()
 
     def watch_worker_telemetry(self) -> None:
-        """Append the latest telemetry sample to the graphs and redraw."""
         self._refresh_graphs()
 
     def _reset_histories(self) -> None:

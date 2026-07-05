@@ -1,12 +1,4 @@
-"""Worker-pool telemetry sampling via psutil and a Redis key store.
-
-The :class:`TelemetrySampler` runs as a single thread on the
-:class:`~threadmill.executor.TaskExecutor` (one per node/host), periodically
-sampling system CPU/memory plus rolling task throughput and publishing a
-:class:`~threadmill.backends.base.WorkerTelemetry` snapshot through the
-backend's :meth:`publish_worker_telemetry` hook. `psutil` is optional; when
-missing, the sampler is a silent no-op so the worker command still functions.
-"""
+"""Worker-pool telemetry sampling via psutil and a Redis pub/sub."""
 
 from __future__ import annotations
 
@@ -32,7 +24,7 @@ except ImportError:  # pragma: no cover - exercised via the guarded path
     psutil = None  # type: ignore[assignment]
 
 
-SAMPLE_INTERVAL_SECONDS = 2.0
+SAMPLE_INTERVAL_SECONDS = 1.0
 """Default seconds between worker telemetry samples."""
 
 

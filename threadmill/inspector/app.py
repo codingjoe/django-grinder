@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import collections
 import datetime
 import logging
 
@@ -44,7 +45,7 @@ from .worker_view import (
 
 logger = logging.getLogger(__name__)
 
-TELEMETRY_INTERVAL_SECONDS = 2.0
+TELEMETRY_INTERVAL_SECONDS = 1.0
 """Seconds between automatic queue-stat refreshes; the task list stays manual."""
 
 __all__ = [
@@ -58,6 +59,21 @@ __all__ = [
     "WorkerTreeNode",
     "si_prefix",
 ]
+
+
+class NodeTelemetryCache(collections.OrderedDict[str, NodeTelemetry]):
+    """Bounded LRU of the latest per-host worker telemetry."""
+
+    def __init__(self, maxlen: int) -> None:
+        super().__init__()
+        self.maxlen = maxlen
+
+    def __setitem__(self, key, value) -> None:  # type: ignore[override]
+        if key in self:
+            self.move_to_end(key)
+        super().__setitem__(key, value)
+        while len(self) > self.maxlen:
+            self.popitem(last=False)
 
 
 class InspectorApp(App):
@@ -86,6 +102,7 @@ class InspectorApp(App):
         backend: ThreadmillTaskBackend,
         *,
         auto_refresh: bool = True,
+        node_cache_max: int = 100,
     ) -> None:
         super().__init__()
         self._queue_list: QueueList | None = None
@@ -96,7 +113,7 @@ class InspectorApp(App):
         self._worker_graphs: WorkerGraphs | None = None
         self._telemetry_timer = None
         self._auto_refresh = auto_refresh
-        self._node_cache: dict[str, NodeTelemetry] = {}
+        self._node_cache: NodeTelemetryCache = NodeTelemetryCache(maxlen=node_cache_max)
         self.set_reactive(InspectorApp.backend, backend)
 
     def compose(self) -> ComposeResult:
@@ -256,27 +273,10 @@ class InspectorApp(App):
         )
 
     async def _subscribe_worker_telemetry(self) -> None:
-        """Maintain a pub/sub subscription; cache the latest snapshot per host.
-
-        Each message updates the per-host cache silently; the reactive
-        `worker_telemetry` is only rebuilt on the 2-second timer tick
-        (`_refresh_telemetry`) to avoid flooding the UI with redraws.
-        """
+        """Maintain a pub/sub subscription; cache the latest snapshot per host."""
         try:
             async for snapshot in self.backend.subscribe_worker_telemetry():
                 for hostname, node in snapshot.nodes.items():
                     self._node_cache[hostname] = node
-                self._prune_nodes(10)
         except Exception:  # noqa: BLE001
             logger.exception("Worker telemetry subscription failed")
-
-    def _prune_nodes(self, ttl_seconds: int) -> None:
-        """Drop cached nodes whose latest sample is older than the TTL."""
-        cutoff = datetime.datetime.now(tz=datetime.UTC) - datetime.timedelta(
-            seconds=ttl_seconds
-        )
-        self._node_cache = {
-            hostname: node
-            for hostname, node in self._node_cache.items()
-            if node.sampled_at > cutoff
-        }
