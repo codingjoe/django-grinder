@@ -123,7 +123,8 @@ TaskDetail {
     }
 }
 
-#worker-graphs Sparkline {
+#worker-graphs Sparkline,
+#worker-graphs PlotextPlot {
     height: 1fr;
     border: round $accent 40%;
     border-title-color: $primary;
@@ -134,10 +135,27 @@ TaskDetail {
     color: $primary;
 }
 
-#worker-cpu-graph {
-    color: $warning;
+
+
+#queue-sparklines {
+    height: auto;
+    padding: 0 1;
 }
 
-#worker-memory-graph {
+#ingress-sparkline {
+    width: 1fr;
+    height: 3;
     color: $success;
+    border: round $accent 40%;
+    border-title-color: $success;
+    border-title-align: right;
+}
+
+#egress-sparkline {
+    width: 1fr;
+    height: 3;
+    color: $warning;
+    border: round $accent 40%;
+    border-title-color: $warning;
+    border-title-align: right;
 }

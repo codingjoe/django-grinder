@@ -30,6 +30,7 @@ from .queue_view import (
     TAB_KEYS,
     QueueItem,
     QueueList,
+    QueueSparklines,
     TaskDetail,
     TaskList,
 )
@@ -52,6 +53,7 @@ __all__ = [
     "InspectorApp",
     "QueueItem",
     "QueueList",
+    "QueueSparklines",
     "SelectionTree",
     "TaskDetail",
     "TaskList",
@@ -108,6 +110,7 @@ class InspectorApp(App):
         self._queue_list: QueueList | None = None
         self._task_list: TaskList | None = None
         self._task_detail: TaskDetail | None = None
+        self._queue_sparklines: QueueSparklines | None = None
         self._options_static: Static | None = None
         self._selection_tree: SelectionTree | None = None
         self._worker_graphs: WorkerGraphs | None = None
@@ -134,6 +137,9 @@ class InspectorApp(App):
                         telemetry=InspectorApp.telemetry
                     )
                 with Vertical(classes="right-pane"):
+                    yield QueueSparklines(id="queue-sparklines").data_bind(
+                        telemetry=InspectorApp.telemetry,
+                    )
                     yield TaskList(id="task-list").data_bind(
                         backend=InspectorApp.backend,
                         telemetry=InspectorApp.telemetry,
@@ -159,6 +165,7 @@ class InspectorApp(App):
         self._queue_list = self.query_one("#queue-list", QueueList)
         self._task_list = self.query_one("#task-list", TaskList)
         self._task_detail = self.query_one("#task-detail", TaskDetail)
+        self._queue_sparklines = self.query_one("#queue-sparklines", QueueSparklines)
         self._options_static = self.query_one("#backend-options", Static)
         self._selection_tree = self.query_one("#selection-tree", SelectionTree)
         self._worker_graphs = self.query_one("#worker-graphs", WorkerGraphs)
@@ -238,11 +245,13 @@ class InspectorApp(App):
         """Update the task list when a queue is selected."""
         if queue_name := self._queue_from_item(event.item):
             self._task_list.queue_name = queue_name
+            self._queue_sparklines.queue_name = queue_name
 
     def on_list_view_highlighted(self, event: ListView.Highlighted) -> None:
         """Preview the selected queue without requiring Enter."""
         if queue_name := self._queue_from_item(event.item):
             self._task_list.queue_name = queue_name
+            self._queue_sparklines.queue_name = queue_name
 
     def _refresh_options(self) -> None:
         """Show the selected backend's constructor options."""

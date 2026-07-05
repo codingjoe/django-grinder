@@ -11,6 +11,7 @@ from textual.app import ComposeResult
 from textual.reactive import reactive
 from textual.widgets import Sparkline, Static, Tree
 from textual.widgets.tree import TreeNode
+from textual_plotext import PlotextPlot
 
 from ..backends.base import BackendTelemetry, NodeTelemetry, WorkerTelemetry
 from .utils import si_prefix
@@ -136,8 +137,8 @@ class WorkerGraphs(Static):
         yield Sparkline(
             id="worker-throughput-graph", data=list(self._throughput_history)
         )
-        yield Sparkline(id="worker-cpu-graph", data=list(self._cpu_history))
-        yield Sparkline(id="worker-memory-graph", data=list(self._memory_history))
+        yield PlotextPlot(id="worker-cpu-graph")
+        yield PlotextPlot(id="worker-memory-graph")
 
     def watch_selection(self) -> None:
         self._reset_histories()
@@ -178,21 +179,36 @@ class WorkerGraphs(Static):
         self._update_border_titles(node)
         try:
             throughput = self.query_one("#worker-throughput-graph", Sparkline)
-            cpu = self.query_one("#worker-cpu-graph", Sparkline)
-            mem = self.query_one("#worker-memory-graph", Sparkline)
+            cpu = self.query_one("#worker-cpu-graph", PlotextPlot)
+            mem = self.query_one("#worker-memory-graph", PlotextPlot)
         except Exception:  # noqa: BLE001
             logger.debug("Worker graph widgets not yet mounted")
             return
         throughput.data = list(self._throughput_history)
-        cpu.data = list(self._cpu_history)
-        mem.data = list(self._memory_history)
+        self._draw_plot(cpu, self._cpu_history, ylim=(0, 100), color="yellow")
+        self._draw_plot(mem, self._memory_history, ylim=(0, 100), color="green")
+
+    @staticmethod
+    def _draw_plot(
+        plot: PlotextPlot, data: deque[float], *, ylim: tuple[float, float], color: str
+    ) -> None:
+        """Redraw a PlotextPlot line chart from the given samples."""
+        plt = plot.plt
+        plt.clear_data()
+        plt.bar(list(data), color=color)
+        plt.ylim(*ylim)
+        plt.xlabel(None)
+        plt.xticks([])
+        plt.yticks([])
+        plt.frame(False)
+        plot.refresh()
 
     def _update_border_titles(self, node: NodeTelemetry) -> None:
         """Show current values in the sparkline border titles."""
         try:
             throughput = self.query_one("#worker-throughput-graph", Sparkline)
-            cpu = self.query_one("#worker-cpu-graph", Sparkline)
-            mem = self.query_one("#worker-memory-graph", Sparkline)
+            cpu = self.query_one("#worker-cpu-graph", PlotextPlot)
+            mem = self.query_one("#worker-memory-graph", PlotextPlot)
         except Exception:  # noqa: BLE001
             return
         memory_percent = self._memory_percent(node)

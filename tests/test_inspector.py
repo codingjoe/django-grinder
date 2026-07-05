@@ -646,7 +646,7 @@ class TestWorkerView:
             await pilot.pause()
             mem = graphs.query_one("#worker-memory-graph")
             assert "RAM" in mem.border_title
-            assert "4GB/8GB" in mem.border_title
+            assert "4.37GB/7.5GB" in mem.border_title
             assert "50%" in mem.border_title
 
     async def test_toggle_view_shows_worker_widgets(self):

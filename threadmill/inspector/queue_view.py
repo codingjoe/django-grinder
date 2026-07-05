@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from collections import deque
 from typing import Any
 
 from django.contrib.humanize.templatetags.humanize import naturaltime
@@ -12,13 +13,14 @@ from django.tasks import (
     TaskResultStatus,
 )
 from textual.app import ComposeResult
-from textual.containers import Vertical
+from textual.containers import Horizontal, Vertical
 from textual.reactive import reactive
 from textual.theme import BUILTIN_THEMES
 from textual.widgets import (
     DataTable,
     ListItem,
     ListView,
+    Sparkline,
     Static,
     TabbedContent,
     TabPane,
@@ -255,6 +257,62 @@ class TaskList(Vertical):
         if row is not None:
             table.move_cursor(row=row)
         self.selected_task = self._current_results[row] if row is not None else None
+
+
+class QueueSparklines(Horizontal):
+    """Slim continuous ingress/egress sparklines for the selected queue."""
+
+    GRAPH_HISTORY_SIZE = 60  # one minute of 1-second samples
+    telemetry: reactive[BackendTelemetry | None] = reactive(None)
+    queue_name: reactive[str] = reactive("")
+
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self._ingress_history: deque[float] = deque(
+            [0.0] * self.GRAPH_HISTORY_SIZE, maxlen=self.GRAPH_HISTORY_SIZE
+        )
+        self._egress_history: deque[float] = deque(
+            [0.0] * self.GRAPH_HISTORY_SIZE, maxlen=self.GRAPH_HISTORY_SIZE
+        )
+
+    def compose(self) -> ComposeResult:
+        yield Sparkline(id="ingress-sparkline", data=list(self._ingress_history))
+        yield Sparkline(id="egress-sparkline", data=list(self._egress_history))
+
+    def watch_queue_name(self) -> None:
+        self._reset_histories()
+        self._refresh()
+
+    def watch_telemetry(self) -> None:
+        self._refresh()
+
+    def _reset_histories(self) -> None:
+        """Clear the sparkline histories back to pre-filled zeros."""
+        for history in (self._ingress_history, self._egress_history):
+            history.clear()
+            history.extend([0.0] * self.GRAPH_HISTORY_SIZE)
+
+    def _refresh(self) -> None:
+        """Append the latest rate sample and redraw both sparklines."""
+        telemetry = self.telemetry
+        if telemetry is None or not self.queue_name:
+            return
+        stats = telemetry.queues.get(self.queue_name)
+        if stats is None:
+            return
+        rates = stats.rates
+        self._ingress_history.append(rates.ingress)
+        self._egress_history.append(rates.egress)
+        try:
+            ingress = self.query_one("#ingress-sparkline", Sparkline)
+            egress = self.query_one("#egress-sparkline", Sparkline)
+        except Exception:  # noqa: BLE001
+            logger.debug("Queue sparkline widgets not yet mounted")
+            return
+        ingress.data = list(self._ingress_history)
+        egress.data = list(self._egress_history)
+        ingress.border_title = f"Ingress  +{si_prefix(rates.ingress)}"
+        egress.border_title = f"Egress  -{si_prefix(rates.egress)}"
 
 
 class QueueList(ListView):
