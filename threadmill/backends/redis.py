@@ -1,7 +1,5 @@
 """Redis-backed durable priority queue backend for Django's task framework."""
 
-from __future__ import annotations
-
 import dataclasses
 import datetime
 import logging

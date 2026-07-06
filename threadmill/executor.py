@@ -1,7 +1,5 @@
 """Task worker executor implementation."""
 
-from __future__ import annotations
-
 import asyncio
 import dataclasses
 import datetime
@@ -205,7 +203,7 @@ class WorkerThread(threading.Thread):
                     timeout=datetime.timedelta(seconds=1),
                     worker=self.name,
                 )
-            except (Empty, TimeoutError):
+            except Empty, TimeoutError:
                 if self.worker.shutdown_requested.is_set() or self.worker.exit_empty:
                     return
                 continue

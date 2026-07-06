@@ -1,7 +1,5 @@
 """Textual app for the inspector TUI."""
 
-from __future__ import annotations
-
 import datetime
 import logging
 import math
