@@ -7,7 +7,6 @@ import json
 import threading
 from abc import ABC
 
-import django
 from django.core.serializers.json import DjangoJSONEncoder
 from django.tasks import DEFAULT_TASK_QUEUE_NAME, Task, TaskResult, TaskResultStatus
 from django.tasks.backends.base import BaseTaskBackend
@@ -15,27 +14,6 @@ from django.tasks.base import TaskContext, TaskError
 from django.tasks.exceptions import InvalidTask
 from django.utils.inspect import is_module_level_function
 from django.utils.module_loading import import_string
-
-if django.VERSION == (6, 0):
-    # https://github.com/django/django/commit/8c8b833d32c02d3ae6f43b04bb1e45968796b402
-    @dataclasses.dataclass(frozen=True, slots=True, kw_only=True)
-    class Task(Task):
-        @classmethod
-        def _reconstruct(cls, kwargs):
-            func_path = kwargs["func"]
-            try:
-                func = import_string(func_path)
-                kwargs["func"] = func.func
-            except (ImportError, AttributeError) as e:
-                msg = f"Expected {func_path!r} to point to a Task instance."
-                raise ValueError(msg) from e
-            return cls(**kwargs)
-
-        def __reduce__(self):
-            kwargs = {f.name: getattr(self, f.name) for f in dataclasses.fields(self)}
-            kwargs["func"] = self.module_path
-
-            return (self.__class__._reconstruct, (kwargs,))
 
 
 @dataclasses.dataclass(frozen=True, slots=True, kw_only=True)
@@ -240,7 +218,7 @@ class ThreadmillTaskBackend(BaseTaskBackend, ABC):
         *,
         status: TaskResultStatus,
         count: int = 1,
-    ) -> collections.abc.Generator[TaskResult, None, None]:
+    ) -> collections.abc.Generator[TaskResult]:
         """
         Yield up to `count` tasks from a queue in the given status segment.
 
