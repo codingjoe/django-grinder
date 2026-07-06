@@ -3,6 +3,7 @@ import dataclasses
 import datetime
 import json
 import threading
+import typing
 from abc import ABC
 
 from django.core.serializers.json import DjangoJSONEncoder
@@ -35,15 +36,22 @@ class RetryTask(Task):
     )
 
     @property
-    def retry_path(self) -> str | None:
+    def retry_path(self) -> tuple[str, tuple, dict[str, typing.Any]] | str | None:
         """Importable dotted path of the retry callback, or None."""
         if self.retry:
+            if hasattr(self.retry, "deconstruct"):
+                return self.retry.deconstruct()
             return f"{self.retry.__module__}.{self.retry.__qualname__}"
 
     @classmethod
     def _reconstruct(cls, kwargs):
         if retry_path := kwargs.pop("retry", None):
-            kwargs["retry"] = import_string(retry_path)
+            try:
+                retry_path, args, kwargs = retry_path
+            except ValueError:
+                kwargs["retry"] = import_string(retry_path)
+            else:
+                kwargs["retry"] = import_string(retry_path)(*args, **kwargs)
         return super()._reconstruct(kwargs)
 
     def __reduce__(self):
@@ -177,9 +185,11 @@ class ThreadmillTaskBackend(BaseTaskBackend, ABC):
 
     def validate_task(self, task: RetryTask) -> None:
         super().validate_task(task)
-        if task.retry is not None and not is_module_level_function(task.retry):
+        if task.retry is not None and not (
+            is_module_level_function(task.retry) or hasattr(task.retry, "deconstruct")
+        ):
             raise InvalidTask(
-                "Task's retry function must be defined at a module level."
+                "Task's retry function must be defined at a module level or be a deconstructible callable."
             )
 
     def acquire(

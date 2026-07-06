@@ -4,7 +4,7 @@ from unittest.mock import patch
 
 import pytest
 from django.core.management import CommandError, call_command
-from django.tasks import Task, default_task_backend
+from django.tasks import default_task_backend
 
 from tests.testapp.tasks import compute_workload, io_workload, memory_workload
 from threadmill.management.commands import threadmill
@@ -131,7 +131,9 @@ class TestCommand:
     def test_call_command__benchmark_default_queue(self, benchmark):
         """Benchmark command execution for default queue tasks."""
         backend = default_task_backend
-        task = Task(func=compute_workload.func, queue_name="default")
+        task = default_task_backend.task_class(
+            func=compute_workload.func, queue_name="default"
+        )
         for _ in range(100):
             backend.enqueue(task, args=[])
 
