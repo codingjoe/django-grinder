@@ -3,11 +3,24 @@ import time
 import uuid
 
 import pytest
-from django.tasks import TaskResult, TaskResultStatus
+from django.tasks import (
+    TaskResult,
+    TaskResultStatus,
+    TaskResultStatus as TRS,
+)
 from django.tasks.base import TaskError
-from django.utils import timezone
+from django.tasks.exceptions import InvalidTask
+from django.utils import (
+    timezone,
+    timezone as tz,
+)
 
-from threadmill.backends.base import Broker, ThreadmillTaskBackend
+from tests.testapp.tasks import (
+    boom_with_retry,
+    echo,
+    retry_always,
+)
+from threadmill.backends.base import Broker, RetryTask, ThreadmillTaskBackend
 from threadmill.exceptions import AcknowledgementTimeout
 
 
@@ -129,18 +142,6 @@ class TestBroker:
         assert not broker.shutdown_requested.is_set()
         broker.shutdown()
         assert broker.shutdown_requested.is_set()
-
-
-from django.tasks import TaskResultStatus as TRS  # noqa: E402
-from django.tasks.exceptions import InvalidTask  # noqa: E402
-from django.utils import timezone as tz  # noqa: E402
-
-from tests.testapp.tasks import (  # noqa: E402
-    boom_with_retry,
-    echo,
-    retry_always,
-)
-from threadmill.backends.base import RetryTask  # noqa: E402
 
 
 def _task_result_with_retry(task, *, errors=None, worker_ids=None) -> TaskResult:

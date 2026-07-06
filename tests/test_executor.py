@@ -16,9 +16,16 @@ from django.tasks import (
 )
 from django.utils import timezone
 
-from tests.testapp.tasks import boom, echo
-from threadmill.backends.base import Broker  # noqa: E402
-from threadmill.executor import TaskExecutor, WorkerProcess, WorkerThread  # noqa: E402
+from tests.testapp.tasks import (
+    boom,
+    boom_no_retry,
+    boom_retry_raises,
+    boom_retry_thrice,
+    boom_with_retry,
+    echo,
+)
+from threadmill.backends.base import Broker
+from threadmill.executor import TaskExecutor, WorkerProcess, WorkerThread
 
 
 @task(queue_name="default")
@@ -309,14 +316,6 @@ class TestWorkerThread:
             error = WorkerThread.create_task_error(sys.exc_info()[1])
         assert "RuntimeError" in error.exception_class_path
         assert "test error" in error.traceback
-
-
-from tests.testapp.tasks import (  # noqa: E402
-    boom_no_retry,
-    boom_retry_raises,
-    boom_retry_thrice,
-    boom_with_retry,
-)
 
 
 class TestRetryDelay:
