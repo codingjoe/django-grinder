@@ -47,11 +47,11 @@ class RetryTask(Task):
     def _reconstruct(cls, kwargs):
         if retry_path := kwargs.pop("retry", None):
             try:
-                retry_path, args, kwargs = retry_path
+                path, pos_args, kw_args = retry_path
             except ValueError:
                 kwargs["retry"] = import_string(retry_path)
             else:
-                kwargs["retry"] = import_string(retry_path)(*args, **kwargs)
+                kwargs["retry"] = import_string(path)(*pos_args, **kw_args)
         return super()._reconstruct(kwargs)
 
     def __reduce__(self):

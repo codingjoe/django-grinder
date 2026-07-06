@@ -317,10 +317,6 @@ class TestWorkerThread:
         assert "RuntimeError" in error.exception_class_path
         assert "test error" in error.traceback
 
-
-class TestRetryDelay:
-    """Tests for WorkerThread.retry_delay."""
-
     def test_retry_delay__none_when_task_has_no_retry(self) -> None:
         """Return None when the task has no retry callback."""
         result = _task_result(boom)
@@ -390,10 +386,6 @@ class TestRetryDelay:
         result_with_workers = dataclasses.replace(result, worker_ids=["w1", "w2"])
         delay = WorkerThread.retry_delay(result_with_workers)
         assert delay == datetime.timedelta(seconds=1)
-
-
-class TestWorkerThreadRetry:
-    """Tests for retry integration in WorkerThread.run()."""
 
     def test_run__requeues_failed_task_with_retry(self) -> None:
         """run() requeues a FAILED task when retry_delay returns a timedelta."""

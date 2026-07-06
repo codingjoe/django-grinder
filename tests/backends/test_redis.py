@@ -9,7 +9,7 @@ from django.tasks import default_task_backend
 from django.tasks.base import TaskResultStatus
 from django.utils import timezone
 
-from tests.testapp.tasks import boom, compute_workload, echo
+from tests.testapp.tasks import boom, boom_with_retry, compute_workload, echo
 from threadmill.backends.base import (
     BackendTelemetry,
     QueueCounts,
@@ -583,10 +583,6 @@ class TestRedisTaskBackend:
         finally:
             backend.close()
 
-
-class TestRedisTaskBackendPeek:
-    """Tests for the RedisTaskBackend peek API."""
-
     def _acknowledge(self, status: TaskResultStatus) -> str:
         """Enqueue, acquire, and acknowledge a task with the given status."""
         task_result = default_task_backend.enqueue(echo, args=[1])
@@ -685,13 +681,6 @@ class TestRedisTaskBackendPeek:
         )
         assert successful == []
         assert failed == []
-
-
-from tests.testapp.tasks import boom_with_retry  # noqa: E402
-
-
-class TestRedisRequeue:
-    """Tests for RedisTaskBackend.requeue."""
 
     def test_requeue__moves_from_running_to_deferred(self) -> None:
         """requeue() removes from running set and adds to deferred set."""
