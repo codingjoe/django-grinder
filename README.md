@@ -130,6 +130,75 @@ every multi-key operation — including the cross-queue acquire — runs on a si
 shard. Scale horizontally by running additional backend aliases, not by relying
 on cross-slot operations.
 
+### Retrying failed tasks
+
+Pass a `retry` callback to `@task()` to retry failed tasks with a delay.
+The callback receives a `TaskContext` — use `context.attempt` for the current
+attempt count and `context.task_result.errors[-1]` for the latest error.
+Return a `timedelta` to schedule the next attempt, or `None` to stop retrying.
+
+The worker re-queues the failed task, preserving its ID and error history;
+the broker promotes it back to the ready queue once the delay elapses.
+
+#### Built-in `ExponentialBackoff`
+
+`threadmill.retry.ExponentialBackoff` provides a serializable exponential
+backoff strategy out of the box. It caps the delay at `max_delay`, stops
+after `max_retries` attempts, and only retries exceptions listed in
+`expected_exceptions`.
+
+```python
+import datetime
+
+from django.tasks import task
+from requests import HTTPError
+
+from threadmill.retry import ExponentialBackoff
+
+
+@task(
+    retry=ExponentialBackoff(
+        base_delay=datetime.timedelta(seconds=1),
+        max_delay=datetime.timedelta(minutes=5),
+        factor=2.0,
+        max_retries=5,
+        expected_exceptions=(HTTPError,),
+    )
+)
+def fetch_github_api(url: str): ...
+```
+
+#### Custom retry callbacks
+
+For cases that need logic beyond what `ExponentialBackoff` supports,
+write a callable that accepts a `TaskContext` and returns a `timedelta`
+or `None`. Use `TaskError.exception_class` to filter by exception type:
+
+```python
+import datetime
+
+from django.tasks import task
+from django.tasks.base import TaskContext
+from requests import HTTPError
+
+
+def retry_on_rate_limit(context: TaskContext) -> datetime.timedelta | None:
+    """Retry HTTP 429 responses with exponential backoff, up to 5 attempts."""
+    if context.attempt >= 5:
+        return None
+    error = context.task_result.errors[-1]
+    if not issubclass(error.exception_class, HTTPError):
+        return None
+    return min(
+        datetime.timedelta(seconds=2**context.attempt),
+        datetime.timedelta(seconds=60),
+    )
+
+
+@task(retry=retry_on_rate_limit)
+def fetch_github_api(url: str): ...
+```
+
 ## Sponsors
 
 [![Sponsors](https://django.the-box.sh/sponsors/codingjoe/threadmill.svg)](https://github.com/sponsors/codingjoe)

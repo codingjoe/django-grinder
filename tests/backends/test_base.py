@@ -1,15 +1,33 @@
-from __future__ import annotations
-
 import datetime
+import json
+import pickle
 import time
 import uuid
 
 import pytest
-from django.tasks import TaskResult, TaskResultStatus
+from django.tasks import (
+    TaskResult,
+    TaskResultStatus,
+    TaskResultStatus as TRS,
+)
 from django.tasks.base import TaskError
-from django.utils import timezone
+from django.tasks.exceptions import InvalidTask
+from django.utils import (
+    timezone,
+    timezone as tz,
+)
 
-from threadmill.backends.base import Broker, ThreadmillTaskBackend
+from tests.testapp.tasks import (
+    boom_with_retry,
+    echo,
+    retry_always,
+)
+from threadmill.backends.base import (
+    Broker,
+    RetryTask,
+    ThreadmillTaskBackend,
+    _parse_datetime,
+)
 from threadmill.exceptions import AcknowledgementTimeout
 
 
@@ -31,7 +49,9 @@ class BackendDouble(ThreadmillTaskBackend):
         )
 
 
-class TestAcknowledgeableTaskBackend:
+class TestThreadmillTaskBackend:
+    """Tests for the ThreadmillTaskBackend class."""
+
     def test_acquire__raise_not_implemented_error(self) -> None:
         """Raise NotImplementedError for backend acquire API."""
         with pytest.raises(NotImplementedError):
@@ -43,6 +63,14 @@ class TestAcknowledgeableTaskBackend:
         """Raise NotImplementedError for backend acknowledge API."""
         with pytest.raises(NotImplementedError):
             BackendDouble(alias="default", params={}).acknowledge(task_result=None)
+
+    def test_requeue__raise_not_implemented_error(self) -> None:
+        """Raise NotImplementedError for backend requeue API."""
+        with pytest.raises(NotImplementedError):
+            BackendDouble(alias="default", params={}).requeue(
+                task_result=None,
+                run_after=timezone.now(),
+            )
 
     def test_peek__raise_not_implemented_error(self) -> None:
         """Raise NotImplementedError for backend peek_results API."""
@@ -57,6 +85,159 @@ class TestAcknowledgeableTaskBackend:
         """Raise NotImplementedError for backend telemetry API."""
         with pytest.raises(NotImplementedError):
             BackendDouble(alias="default", params={}).telemetry()
+
+    def test_validate_task__accepts_module_level_function(self) -> None:
+        """validate_task accepts a module-level retry callback."""
+        backend = BackendDouble(alias="default", params={})
+        backend.validate_task(boom_with_retry)
+
+    def test_validate_task__accepts_deconstructible_callable(self) -> None:
+        """validate_task accepts a retry callback with a deconstruct method."""
+        backend = BackendDouble(alias="default", params={})
+        task = RetryTask(func=echo.func, retry=DeconstructibleRetry())
+        backend.validate_task(task)
+
+    def test_validate_task__accepts_none_retry(self) -> None:
+        """validate_task accepts a task with retry=None."""
+        backend = BackendDouble(alias="default", params={})
+        task = RetryTask(func=echo.func)
+        backend.validate_task(task)
+
+    def test_validate_task__rejects_lambda(self) -> None:
+        """Reject a non-module-level retry callback during task creation."""
+        with pytest.raises(InvalidTask):
+            RetryTask(
+                func=echo.func,
+                retry=lambda ctx: None,
+            )
+
+    def test_serialize_task_result__encodes_retry_as_path(self) -> None:
+        """TaskResultEncoder serializes retry as a dotted path."""
+        result = _task_result_with_retry(boom_with_retry)
+        data = ThreadmillTaskBackend.serialize_task_result(result)
+        assert "tests.testapp.tasks.retry_always" in data
+
+    def test_serialize_task_result__omits_retry_when_none(self) -> None:
+        """TaskResultEncoder omits retry when it is None."""
+        task = RetryTask(func=echo.func)
+        result = TaskResult(
+            task=task,
+            id=str(uuid.uuid4()),
+            status=TRS.READY,
+            enqueued_at=tz.now(),
+            started_at=None,
+            finished_at=None,
+            last_attempted_at=None,
+            backend="default",
+            errors=[],
+            worker_ids=[],
+            args=[],
+            kwargs={},
+        )
+        data = ThreadmillTaskBackend.serialize_task_result(result)
+        decoded = json.loads(data)
+        assert decoded["task"]["retry"] is None
+
+    def test_serialize_task_result__raises_type_error_for_unknown_object(
+        self,
+    ) -> None:
+        """TaskResultEncoder raises TypeError for objects it cannot serialize."""
+        with pytest.raises(TypeError):
+            ThreadmillTaskBackend.serialize_task_result(object())
+
+    def test_deserialize_task_result__roundtrips_retry_callback(self) -> None:
+        """deserialize_task_result restores the retry callable from path."""
+        result = _task_result_with_retry(boom_with_retry)
+        data = ThreadmillTaskBackend.serialize_task_result(result)
+        restored = ThreadmillTaskBackend.deserialize_task_result(data)
+        assert restored.task.retry is retry_always
+        assert restored.task.retry_path == "tests.testapp.tasks.retry_always"
+
+    def test_deserialize_task_result__roundtrips_without_retry(self) -> None:
+        """deserialize_task_result works when retry is None."""
+        result = _task_result_with_retry(echo)
+        data = ThreadmillTaskBackend.serialize_task_result(result)
+        restored = ThreadmillTaskBackend.deserialize_task_result(data)
+        assert restored.task.retry is None
+
+    def test_deserialize_task_result__roundtrips_deconstructible_retry(self) -> None:
+        """deserialize_task_result restores a deconstructible retry callable."""
+        task = RetryTask(func=echo.func, retry=DeconstructibleRetry(seconds=5))
+        result = _task_result_with_retry(task)
+        data = ThreadmillTaskBackend.serialize_task_result(result)
+        restored = ThreadmillTaskBackend.deserialize_task_result(data)
+        assert isinstance(restored.task.retry, DeconstructibleRetry)
+        assert restored.task.retry.seconds == 5
+
+    def test_deserialize_task_result__preserves_errors(self) -> None:
+        """deserialize_task_result preserves accumulated errors."""
+        error = TaskError(
+            exception_class_path="ValueError",
+            traceback="traceback",
+        )
+        result = _task_result_with_retry(boom_with_retry, errors=[error])
+        data = ThreadmillTaskBackend.serialize_task_result(result)
+        restored = ThreadmillTaskBackend.deserialize_task_result(data)
+        assert len(restored.errors) == 1
+        assert restored.errors[0].exception_class_path == "ValueError"
+
+    def test_deserialize_task_result__preserves_return_value(self) -> None:
+        """deserialize_task_result preserves the _return_value attribute."""
+        result = _task_result_with_retry(echo)
+        object.__setattr__(result, "_return_value", 42)
+        data = ThreadmillTaskBackend.serialize_task_result(result)
+        restored = ThreadmillTaskBackend.deserialize_task_result(data)
+        assert restored._return_value == 42
+
+
+class TestRetryTask:
+    """Tests for the RetryTask class."""
+
+    def test_retry_path__none_when_no_retry(self) -> None:
+        """Return None when retry callback is not set."""
+        task = RetryTask(func=echo.func)
+        assert task.retry_path is None
+
+    def test_retry_path__returns_dotted_path(self) -> None:
+        """Return the importable dotted path of the retry callback."""
+        task = RetryTask(func=echo.func, retry=retry_always)
+        assert task.retry_path == "tests.testapp.tasks.retry_always"
+
+    def test_retry_path__returns_deconstruct_tuple(self) -> None:
+        """Return the deconstruct() tuple for a deconstructible callable."""
+        retry = DeconstructibleRetry(seconds=5)
+        task = RetryTask(func=echo.func, retry=retry)
+        assert task.retry_path == retry.deconstruct()
+
+    def test_pickle__roundtrips_retry_callback(self) -> None:
+        """Pickle preserves the retry callable by importable path."""
+        result = _task_result_with_retry(boom_with_retry)
+        restored = pickle.loads(pickle.dumps(result))  # noqa: S301
+        assert restored.task.retry is retry_always
+
+    def test_pickle__roundtrips_without_retry(self) -> None:
+        """Pickle works when retry is None."""
+        result = _task_result_with_retry(echo)
+        restored = pickle.loads(pickle.dumps(result))  # noqa: S301
+        assert restored.task.retry is None
+
+
+class TestParseDateTime:
+    """Tests for the _parse_datetime helper."""
+
+    def test_parse_datetime__parses_iso_string(self) -> None:
+        """Parse an ISO datetime string into a datetime object."""
+        now = timezone.now()
+        assert _parse_datetime(now.isoformat()) == now
+
+    def test_parse_datetime__returns_non_string_unchanged(self) -> None:
+        """Non-string values pass through unchanged."""
+        assert _parse_datetime(None) is None
+        assert _parse_datetime(42) == 42
+
+    def test_parse_datetime__returns_invalid_string_unchanged(self) -> None:
+        """Invalid datetime strings pass through unchanged."""
+        assert _parse_datetime("not-a-date") == "not-a-date"
 
 
 class TestAcknowledgementTimeout:
@@ -123,3 +304,42 @@ class TestBroker:
         assert not broker.shutdown_requested.is_set()
         broker.shutdown()
         assert broker.shutdown_requested.is_set()
+
+
+def _task_result_with_retry(task, *, errors=None, worker_ids=None) -> TaskResult:
+    """Build a FAILED TaskResult with errors for retry testing."""
+    now = tz.now()
+    return TaskResult(
+        task=task,
+        id=str(uuid.uuid4()),
+        status=TRS.FAILED,
+        enqueued_at=now,
+        started_at=now,
+        finished_at=now,
+        last_attempted_at=now,
+        backend="default",
+        errors=errors or [],
+        worker_ids=worker_ids or [],
+        args=[],
+        kwargs={},
+    )
+
+
+class DeconstructibleRetry:
+    """A deconstructible retry callable for testing."""
+
+    def __init__(self, *, seconds: int = 1) -> None:
+        self.seconds = seconds
+
+    def __call__(self, context) -> datetime.timedelta:
+        return datetime.timedelta(seconds=self.seconds)
+
+    def deconstruct(self):
+        return (
+            "tests.backends.test_base.DeconstructibleRetry",
+            (),
+            {"seconds": self.seconds},
+        )
+
+    def __eq__(self, other):
+        return isinstance(other, DeconstructibleRetry) and self.seconds == other.seconds

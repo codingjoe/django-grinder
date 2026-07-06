@@ -26,14 +26,11 @@ classifiers = [
   "Programming Language :: Python",
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3 :: Only",
-  "Programming Language :: Python :: 3.12",
-  "Programming Language :: Python :: 3.13",
   "Programming Language :: Python :: 3.14",
   "Framework :: Django",
-  "Framework :: Django :: 6.0",
   "Framework :: Django :: 6.1",
 ]
-requires-python = ">=3.12"
+requires-python = ">=3.14"
 dependencies = ["django>=6.0"]
 
 [project.optional-dependencies]
@@ -59,7 +56,7 @@ name = "threadmill"
 write_to = "threadmill/_version.py"
 
 [tool.pytest.ini_options]
-minversion = "6.0"
+minversion = "6.1a1"
 addopts = "--cov --cov-report=xml --cov-report=term --tb=short -rxs --benchmark-autosave --benchmark-group-by=fullname --benchmark-min-rounds=10"
 testpaths = ["tests"]
 DJANGO_SETTINGS_MODULE = "tests.testapp.settings"

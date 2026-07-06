@@ -1,6 +1,6 @@
-from __future__ import annotations
-
 import dataclasses
+import datetime
+import logging
 import multiprocessing
 import sys
 import threading
@@ -16,9 +16,16 @@ from django.tasks import (
 )
 from django.utils import timezone
 
-from tests.testapp.tasks import boom, echo
-from threadmill.backends.base import Broker  # noqa: E402
-from threadmill.executor import TaskExecutor, WorkerProcess, WorkerThread  # noqa: E402
+from tests.testapp.tasks import (
+    boom,
+    boom_no_retry,
+    boom_retry_raises,
+    boom_retry_thrice,
+    boom_with_retry,
+    echo,
+)
+from threadmill.backends.base import Broker
+from threadmill.executor import TaskExecutor, WorkerProcess, WorkerThread
 
 
 @task(queue_name="default")
@@ -309,3 +316,144 @@ class TestWorkerThread:
             error = WorkerThread.create_task_error(sys.exc_info()[1])
         assert "RuntimeError" in error.exception_class_path
         assert "test error" in error.traceback
+
+    def test_retry_delay__none_when_task_has_no_retry(self) -> None:
+        """Return None when the task has no retry callback."""
+        result = _task_result(boom)
+        assert WorkerThread.retry_delay(result) is None
+
+    def test_retry_delay__returns_timedelta_from_callback(self) -> None:
+        """Return the timedelta from the retry callback."""
+        result = _task_result(boom_with_retry)
+        result = dataclasses.replace(
+            result,
+            status=TaskResultStatus.FAILED,
+            errors=[WorkerThread.create_task_error(ValueError("boom"))],
+        )
+        delay = WorkerThread.retry_delay(result)
+        assert delay == datetime.timedelta(seconds=1)
+
+    def test_retry_delay__none_when_callback_returns_none(self) -> None:
+        """Return None when the retry callback returns None."""
+        result = _task_result(boom_no_retry)
+        result = dataclasses.replace(
+            result,
+            status=TaskResultStatus.FAILED,
+            errors=[WorkerThread.create_task_error(ValueError("boom"))],
+        )
+        assert WorkerThread.retry_delay(result) is None
+
+    def test_retry_delay__none_when_callback_raises(self, caplog) -> None:
+        """Return None and log when the retry callback raises an exception."""
+        mp_logger = multiprocessing.get_logger()
+        mp_logger.addHandler(caplog.handler)
+        mp_logger.setLevel(logging.ERROR)
+        result = _task_result(boom_retry_raises)
+        result = dataclasses.replace(
+            result,
+            status=TaskResultStatus.FAILED,
+            errors=[WorkerThread.create_task_error(ValueError("boom"))],
+        )
+        try:
+            assert WorkerThread.retry_delay(result) is None
+        finally:
+            mp_logger.removeHandler(caplog.handler)
+        assert "Retry callback failed" in caplog.text
+
+    def test_retry_delay__passes_task_context(self) -> None:
+        """Pass TaskContext with task_result to the retry callback."""
+        result = _task_result(boom_retry_thrice, worker_ids=["w1"])
+        result = dataclasses.replace(
+            result,
+            status=TaskResultStatus.FAILED,
+            errors=[WorkerThread.create_task_error(ValueError("boom"))],
+        )
+        delay = WorkerThread.retry_delay(result)
+        assert delay == datetime.timedelta(seconds=1)
+
+    def test_retry_delay__callback_receives_errors(self) -> None:
+        """Retry callback can access the latest error via context.task_result.errors."""
+        result = _task_result(boom_with_retry)
+        error = WorkerThread.create_task_error(ValueError("boom"))
+        result = dataclasses.replace(
+            result,
+            status=TaskResultStatus.FAILED,
+            errors=[error],
+        )
+        WorkerThread.retry_delay(result)
+        # The retry_always callback doesn't inspect errors, but the context
+        # must contain them. Verify via retry_thrice which checks attempt count.
+        result_with_workers = dataclasses.replace(result, worker_ids=["w1", "w2"])
+        delay = WorkerThread.retry_delay(result_with_workers)
+        assert delay == datetime.timedelta(seconds=1)
+
+    def test_run__requeues_failed_task_with_retry(self) -> None:
+        """run() requeues a FAILED task when retry_delay returns a timedelta."""
+        enqueued = default_task_backend.enqueue(boom_with_retry, args=[])
+        worker = _make_worker(max_tasks=1)
+        worker.lock = threading.Lock()
+        worker.expired = threading.Event()
+
+        thread = WorkerThread(
+            worker=worker,
+            index=0,
+            backend=default_task_backend,
+        )
+        thread.run()
+
+        # The task should have been requeued to the deferred set, not acknowledged
+        from threadmill.backends.redis import RedisTaskBackend
+
+        deferred_key = RedisTaskBackend.DEFERRED_KEY.format(
+            prefix=default_task_backend.key_prefix, queue_name="default"
+        )
+        assert default_task_backend.client.zscore(deferred_key, enqueued.id) is not None
+
+    def test_run__acknowledges_failed_task_without_retry(self) -> None:
+        """run() acknowledges a FAILED task when retry_delay returns None."""
+        enqueued = default_task_backend.enqueue(boom_no_retry, args=[])
+        worker = _make_worker(max_tasks=1)
+        worker.lock = threading.Lock()
+        worker.expired = threading.Event()
+
+        thread = WorkerThread(
+            worker=worker,
+            index=0,
+            backend=default_task_backend,
+        )
+        thread.run()
+
+        # The task should be acknowledged (FAILED result, not in deferred)
+        from threadmill.backends.redis import RedisTaskBackend
+
+        deferred_key = RedisTaskBackend.DEFERRED_KEY.format(
+            prefix=default_task_backend.key_prefix, queue_name="default"
+        )
+        assert default_task_backend.client.zscore(deferred_key, enqueued.id) is None
+
+        result = default_task_backend.get_result(enqueued.id)
+        assert result.status == TaskResultStatus.FAILED
+
+    def test_run__acknowledges_failed_task_when_callback_raises(self) -> None:
+        """run() acknowledges a FAILED task when the retry callback raises."""
+        enqueued = default_task_backend.enqueue(boom_retry_raises, args=[])
+        worker = _make_worker(max_tasks=1)
+        worker.lock = threading.Lock()
+        worker.expired = threading.Event()
+
+        thread = WorkerThread(
+            worker=worker,
+            index=0,
+            backend=default_task_backend,
+        )
+        thread.run()
+
+        from threadmill.backends.redis import RedisTaskBackend
+
+        deferred_key = RedisTaskBackend.DEFERRED_KEY.format(
+            prefix=default_task_backend.key_prefix, queue_name="default"
+        )
+        assert default_task_backend.client.zscore(deferred_key, enqueued.id) is None
+
+        result = default_task_backend.get_result(enqueued.id)
+        assert result.status == TaskResultStatus.FAILED

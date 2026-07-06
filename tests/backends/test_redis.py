@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import dataclasses
 import datetime
 import logging
@@ -11,7 +9,7 @@ from django.tasks import default_task_backend
 from django.tasks.base import TaskResultStatus
 from django.utils import timezone
 
-from tests.testapp.tasks import boom, compute_workload, echo
+from tests.testapp.tasks import boom, boom_with_retry, compute_workload, echo
 from threadmill.backends.base import (
     BackendTelemetry,
     QueueCounts,
@@ -585,10 +583,6 @@ class TestRedisTaskBackend:
         finally:
             backend.close()
 
-
-class TestRedisTaskBackendPeek:
-    """Tests for the RedisTaskBackend peek API."""
-
     def _acknowledge(self, status: TaskResultStatus) -> str:
         """Enqueue, acquire, and acknowledge a task with the given status."""
         task_result = default_task_backend.enqueue(echo, args=[1])
@@ -687,3 +681,154 @@ class TestRedisTaskBackendPeek:
         )
         assert successful == []
         assert failed == []
+
+    def test_requeue__moves_from_running_to_deferred(self) -> None:
+        """requeue() removes from running set and adds to deferred set."""
+        backend = RedisTaskBackend(
+            "requeue_test",
+            {
+                "QUEUES": ["default"],
+                "REDIS_URL": "redis://localhost:6379/0",
+                "OPTIONS": {
+                    "lease_ttl": datetime.timedelta(hours=1),
+                    "result_ttl": datetime.timedelta(seconds=60),
+                },
+            },
+        )
+        try:
+            task_result = backend.enqueue(boom_with_retry, args=[])
+            acquired = backend.acquire(
+                timeout=datetime.timedelta(seconds=1), worker="requeue-test"
+            )
+            assert acquired is not None
+
+            # Simulate a failed execution
+            from django.tasks.base import TaskError
+
+            failed = dataclasses.replace(
+                acquired,
+                status=TaskResultStatus.FAILED,
+                finished_at=timezone.now(),
+                errors=[
+                    TaskError(
+                        exception_class_path="ValueError",
+                        traceback="ValueError: boom",
+                    )
+                ],
+            )
+
+            run_after = timezone.now() + datetime.timedelta(seconds=10)
+            backend.requeue(failed, run_after)
+
+            running_key = backend.RUNNING_KEY.format(
+                prefix=backend.key_prefix, queue_name="default"
+            )
+            deferred_key = backend.DEFERRED_KEY.format(
+                prefix=backend.key_prefix, queue_name="default"
+            )
+            assert backend.client.zscore(running_key, task_result.id) is None
+            assert backend.client.zscore(deferred_key, task_result.id) is not None
+        finally:
+            backend.close()
+
+    def test_requeue__preserves_id_and_errors(self) -> None:
+        """requeue() preserves the task ID and accumulated errors."""
+        backend = RedisTaskBackend(
+            "requeue_preserve_test",
+            {
+                "QUEUES": ["default"],
+                "REDIS_URL": "redis://localhost:6379/0",
+                "OPTIONS": {
+                    "lease_ttl": datetime.timedelta(hours=1),
+                    "result_ttl": datetime.timedelta(seconds=60),
+                },
+            },
+        )
+        try:
+            task_result = backend.enqueue(boom_with_retry, args=[])
+            acquired = backend.acquire(
+                timeout=datetime.timedelta(seconds=1), worker="preserve-test"
+            )
+            assert acquired is not None
+
+            from django.tasks.base import TaskError
+
+            error = TaskError(
+                exception_class_path="ValueError",
+                traceback="ValueError: boom",
+            )
+            failed = dataclasses.replace(
+                acquired,
+                status=TaskResultStatus.FAILED,
+                finished_at=timezone.now(),
+                errors=[error],
+            )
+
+            run_after = timezone.now() + datetime.timedelta(seconds=10)
+            backend.requeue(failed, run_after)
+
+            # Verify the stored data preserves ID and errors
+            task_key = backend.TASK_KEY.format(
+                prefix=backend.key_prefix, task_id=task_result.id
+            )
+            stored_data = backend.client.hget(task_key, "data")
+            restored = backend.deserialize_task_result(stored_data)
+            assert restored.id == task_result.id
+            assert len(restored.errors) == 1
+            assert restored.errors[0].exception_class_path == "ValueError"
+            assert restored.status == TaskResultStatus.READY
+            assert restored.started_at is None
+            assert restored.finished_at is None
+        finally:
+            backend.close()
+
+    def test_requeue__task_is_re_acquirable_after_delay(self) -> None:
+        """Requeued task can be acquired after run_after has elapsed."""
+        backend = RedisTaskBackend(
+            "requeue_acquire_test",
+            {
+                "QUEUES": ["default"],
+                "REDIS_URL": "redis://localhost:6379/0",
+                "OPTIONS": {
+                    "lease_ttl": datetime.timedelta(hours=1),
+                    "result_ttl": datetime.timedelta(seconds=60),
+                },
+            },
+        )
+        try:
+            task_result = backend.enqueue(boom_with_retry, args=[])
+            acquired = backend.acquire(
+                timeout=datetime.timedelta(seconds=1), worker="requeue-acq-test"
+            )
+            assert acquired is not None
+
+            from django.tasks.base import TaskError
+
+            failed = dataclasses.replace(
+                acquired,
+                status=TaskResultStatus.FAILED,
+                finished_at=timezone.now(),
+                errors=[
+                    TaskError(
+                        exception_class_path="ValueError",
+                        traceback="ValueError: boom",
+                    )
+                ],
+            )
+
+            # Requeue with a past run_after so it's immediately due
+            run_after = timezone.now() - datetime.timedelta(seconds=1)
+            backend.requeue(failed, run_after)
+
+            # Run the broker to move the deferred task to the ready queue
+            broker = RedisBroker(backend)
+            broker.main()
+
+            # The task should be acquirable again
+            re_acquired = backend.acquire(
+                timeout=datetime.timedelta(seconds=1), worker="requeue-acq-test-2"
+            )
+            assert re_acquired is not None
+            assert re_acquired.id == task_result.id
+        finally:
+            backend.close()

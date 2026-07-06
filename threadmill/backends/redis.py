@@ -1,7 +1,6 @@
 """Redis-backed durable priority queue backend for Django's task framework."""
 
-from __future__ import annotations
-
+import dataclasses
 import datetime
 import logging
 import queue
@@ -314,6 +313,34 @@ class RedisTaskBackend(ThreadmillTaskBackend):
                 task_result.status.name,
             ],
         )
+
+    def requeue(self, task_result: TaskResult, run_after: datetime.datetime) -> None:
+        task_result = dataclasses.replace(
+            task_result,
+            status=TaskResultStatus.READY,
+            started_at=None,
+            finished_at=None,
+        )
+        serialized = self.serialize_task_result(task_result)
+        running_key = self.RUNNING_KEY.format(
+            prefix=self.key_prefix, queue_name=task_result.task.queue_name
+        )
+        deferred_key = self.DEFERRED_KEY.format(
+            prefix=self.key_prefix, queue_name=task_result.task.queue_name
+        )
+        task_key = self.TASK_KEY.format(prefix=self.key_prefix, task_id=task_result.id)
+        score = self._compute_score(task_result.task.priority, task_result.enqueued_at)
+        run_after_ms = run_after.timestamp() * 1000
+        task_data_ttl = int(
+            self.lease_ttl.total_seconds() * 3 + self.result_ttl.total_seconds()
+        )
+
+        pipe = self.client.pipeline()
+        pipe.zrem(running_key, task_result.id)
+        pipe.hset(task_key, mapping={"data": serialized, "score": str(score)})
+        pipe.expire(task_key, task_data_ttl)
+        pipe.zadd(deferred_key, {task_result.id: run_after_ms})
+        pipe.execute()
 
     def peek(
         self,

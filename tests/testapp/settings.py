@@ -14,7 +14,7 @@ import datetime
 import os
 from pathlib import Path
 
-from django.tasks import DEFAULT_TASK_QUEUE_NAME
+from django.tasks import DEFAULT_TASK_BACKEND_ALIAS, DEFAULT_TASK_QUEUE_NAME
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -87,7 +87,7 @@ DATABASES = {
 }
 
 TASKS = {
-    "default": {
+    DEFAULT_TASK_BACKEND_ALIAS: {
         "BACKEND": "threadmill.backends.redis.RedisTaskBackend",
         "QUEUES": [DEFAULT_TASK_QUEUE_NAME, "compute", "io", "memory"],
         "REDIS_URL": os.environ.get("REDIS_URL", "redis://localhost:6379/0"),

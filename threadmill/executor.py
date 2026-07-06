@@ -1,7 +1,5 @@
 """Task worker executor implementation."""
 
-from __future__ import annotations
-
 import asyncio
 import dataclasses
 import datetime
@@ -205,16 +203,31 @@ class WorkerThread(threading.Thread):
                     timeout=datetime.timedelta(seconds=1),
                     worker=self.name,
                 )
-            except (Empty, TimeoutError):
+            except Empty, TimeoutError:
                 if self.worker.shutdown_requested.is_set() or self.worker.exit_empty:
                     return
                 continue
 
             try:
                 result = self.execute_task_result(task_result)
-                self.backend.acknowledge(result)
+                if (
+                    result.status is TaskResultStatus.FAILED
+                    and (delay := self.retry_delay(result)) is not None
+                ):
+                    self.backend.requeue(result, timezone.now() + delay)
+                else:
+                    self.backend.acknowledge(result)
             finally:
                 self.worker.record_task()
+
+    @staticmethod
+    def retry_delay(task_result: TaskResult) -> datetime.timedelta | None:
+        """Return the retry delay for a failed task, or None to stop retrying."""
+        if task_result.task.retry:
+            try:
+                return task_result.task.retry(TaskContext(task_result=task_result))
+            except Exception:
+                logger.exception("Retry callback failed for task %r", task_result.id)
 
     def execute_task_result(self, task_result: TaskResult) -> TaskResult:
         """Execute task from task result and update result lifecycle state."""
