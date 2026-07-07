@@ -30,6 +30,7 @@ from textual.widgets import (
 )
 
 from ..backends.base import BackendTelemetry, ThreadmillTaskBackend
+from .screens import ConfirmScreen, PurgeScreen
 
 logger = logging.getLogger(__name__)
 
@@ -163,6 +164,21 @@ class TaskList(Vertical):
     counts: reactive[dict[str, int]] = reactive({})
     selected_task: reactive[TaskResult | None] = reactive(None)
 
+    BINDINGS = [
+        Binding("f5", "refresh", "Refresh"),
+        Binding("r", "requeue", "Requeue"),
+        Binding("d", "dequeue", "Drop"),
+    ]
+
+    def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
+        """Show requeue only on the Failed tab, dequeue on non-Running tabs."""
+        status = self.active_status()
+        if action == "requeue":
+            return status == TaskResultStatus.FAILED
+        if action == "dequeue":
+            return status is not None and status != TaskResultStatus.RUNNING
+        return True
+
     def compose(self) -> ComposeResult:
         with TabbedContent(initial="tab-ready") as tabs:
             for label, _ in TAB_STATUSES:
@@ -212,6 +228,11 @@ class TaskList(Vertical):
         """Activate the tab with the given id."""
         self._tabs.active = tab_id
 
+    def action_refresh(self) -> None:
+        """Refresh telemetry and re-fetch the task list."""
+        self.app._refresh_telemetry()
+        self.refresh_tasks()
+
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
         """Notify the app when a task row is selected."""
         if isinstance(event.row_key.value, str):
@@ -227,6 +248,7 @@ class TaskList(Vertical):
     ) -> None:
         """Refresh the visible table when the user switches tabs."""
         self._refresh_data()
+        self.refresh_bindings()
 
     def _select_task_by_id(self, task_id: str) -> None:
         """Find the task result matching the row key in the current results."""
@@ -234,6 +256,57 @@ class TaskList(Vertical):
             (result for result in self._current_results if result.id == task_id),
             None,
         )
+
+    def active_status(self) -> TaskResultStatus | None:
+        """Return the status segment of the currently active task tab."""
+        tab_id = self._tabs.active.removeprefix("tab-")
+        return next(
+            (status for label, status in TAB_STATUSES if label.lower() == tab_id),
+            None,
+        )
+
+    def action_requeue(self) -> None:
+        """Requeue the selected failed task after confirmation."""
+        task = self.selected_task
+        if task and self.active_status() == TaskResultStatus.FAILED:
+            self.app.push_screen(
+                ConfirmScreen(f"Requeue task {task.id[:8]}?"),
+                lambda confirmed: self._do_requeue(confirmed, task),
+            )
+
+    def _do_requeue(self, confirmed: bool, task: TaskResult) -> None:
+        if not confirmed:
+            return
+        try:
+            self.backend.requeue(task, datetime.datetime.now(datetime.UTC))
+        except Exception:  # noqa: BLE001
+            logger.exception("Requeue failed for task %s", task.id)
+            self.app.notify("Requeue failed.", severity="error")
+            return
+        self.app._after_action("Task requeued.")
+
+    def action_dequeue(self) -> None:
+        """Remove the selected task from its current segment after confirmation."""
+        task = self.selected_task
+        if task and self.active_status() is not None:
+            self.app.push_screen(
+                ConfirmScreen(
+                    f"Delete task {task.task.func.__name__} ({task.id[:8]})?",
+                    danger=True,
+                ),
+                lambda confirmed: self._do_dequeue(confirmed, task),
+            )
+
+    def _do_dequeue(self, confirmed: bool, task: TaskResult) -> None:
+        if not confirmed:
+            return
+        try:
+            self.backend.dequeue(task)
+        except Exception:  # noqa: BLE001
+            logger.exception("Delete failed for task %s", task.id)
+            self.app.notify("Delete failed.", severity="error")
+            return
+        self.app._after_action("Task deleted.")
 
     def _refresh_data(self) -> None:
         """Fetch and display tasks for the current queue and active tab."""
@@ -291,6 +364,10 @@ class QueueList(ListView):
 
     telemetry: reactive[BackendTelemetry | None] = reactive(None)
 
+    BINDINGS = [
+        Binding("p", "purge", "Purge"),
+    ]
+
     def __init__(self, **kwargs: Any) -> None:
         super().__init__(**kwargs)
         self._items: dict[str, QueueItem] = {}
@@ -300,12 +377,10 @@ class QueueList(ListView):
         self.border_title = "Queues"
 
     def watch_telemetry(self, telemetry: BackendTelemetry | None) -> None:
-        """Refresh queue labels when a new telemetry snapshot arrives."""
         if telemetry is not None:
             self.update_telemetry(telemetry)
 
     def update_telemetry(self, telemetry: BackendTelemetry) -> None:
-        """Refresh queue labels from a new telemetry snapshot."""
         queues = telemetry.queues
         for queue_name, stats in sorted(queues.items()):
             theme = BUILTIN_THEMES[self.app.theme]
@@ -334,8 +409,28 @@ class QueueList(ListView):
             self._notify_selection(target)
 
     def _notify_selection(self, queue_name: str) -> None:
-        """Tell the app which queue to display."""
         self.app._task_list.queue_name = queue_name
+
+    def action_purge(self) -> None:
+        item = self.highlighted_child
+        if not isinstance(item, QueueItem):
+            return
+        queue_name = item.queue_name
+        self.app.push_screen(
+            PurgeScreen(queue_name),
+            lambda confirmed: self._do_purge(confirmed, queue_name),
+        )
+
+    def _do_purge(self, confirmed: bool, queue_name: str) -> None:
+        if not confirmed:
+            return
+        try:
+            self.app.backend.purge(queue_name)
+        except Exception:  # noqa: BLE001
+            logger.exception("Purge failed for %r", queue_name)
+            self.app.notify("Purge failed.", severity="error")
+            return
+        self.app._after_action(f"Purged queue {queue_name}.")
 
 
 class InspectorApp(App):
@@ -343,12 +438,11 @@ class InspectorApp(App):
 
     CSS_PATH = "inspector.scss"
     BINDINGS = [
-        Binding("q", "quit", "Quit"),
-        Binding("f5", "refresh", "Refresh"),
         *(
             Binding(key, f"switch_tab('tab-{tab_id}')", tab_id.capitalize())
             for tab_id, key in TAB_KEYS.items()
         ),
+        Binding("q", "quit", "Quit"),
     ]
 
     backend: reactive[ThreadmillTaskBackend] = reactive(None)
@@ -415,8 +509,9 @@ class InspectorApp(App):
         """Exit the TUI."""
         self.exit()
 
-    def action_refresh(self) -> None:
-        """Refresh queue stats and re-fetch the task list on demand."""
+    def _after_action(self, message: str) -> None:
+        """Refresh telemetry and tasks after a mutating queue action."""
+        self.notify(message)
         self._refresh_telemetry()
         self._task_list.refresh_tasks()
 

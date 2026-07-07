@@ -217,7 +217,12 @@ class ThreadmillTaskBackend(BaseTaskBackend, ABC):
         raise NotImplementedError
 
     def requeue(self, task_result: TaskResult, run_after: datetime.datetime) -> None:
-        """Re-queue a failed task result for a retry attempt after `run_after`."""
+        """Re-queue a failed task result for a retry attempt after `run_after`.
+
+        Cleans up any persisted failed result so the method works both for
+        in-flight retries (task still running) and inspector-driven requeues
+        of already-failed tasks.
+        """
         raise NotImplementedError
 
     def peek(
@@ -244,5 +249,17 @@ class ThreadmillTaskBackend(BaseTaskBackend, ABC):
 
         Args:
             interval: The time window for rolling rates.
+        """
+        raise NotImplementedError
+
+    def dequeue(self, task_result: TaskResult) -> None:
+        """Delete a single task from its current status segment."""
+        raise NotImplementedError
+
+    def purge(self, queue_name: str) -> None:
+        """Delete every task across all segments of a queue.
+
+        Args:
+            queue_name: The queue to purge.
         """
         raise NotImplementedError

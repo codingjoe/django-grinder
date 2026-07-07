@@ -2,6 +2,11 @@ Screen {
     background: $background;
 }
 
+ConfirmScreen,
+PurgeScreen {
+    align: center middle;
+}
+
 * {
     scrollbar-color: $primary 10%;
     scrollbar-color-hover: $primary 80%;
@@ -103,4 +108,30 @@ TaskDetail {
     width: 100%;
     overflow: scroll;
     padding: 0 1;
+}
+
+#dialog {
+    width: 60;
+    height: auto;
+    background: $surface;
+    padding: 1 2;
+}
+
+#dialog.warning {
+    border: thick $warning;
+}
+
+#dialog.danger {
+    border: thick $error;
+}
+
+#prompt {
+    text-align: center;
+    margin-bottom: 1;
+}
+
+#instruction {
+    text-align: center;
+    color: $text-muted;
+    margin-top: 1;
 }

@@ -89,12 +89,10 @@ class TestRedisBroker:
             ingress_key = backend.INGRESS_KEY.format(
                 prefix=backend.key_prefix, queue_name="default"
             )
-            successful_key = backend.SUCCESSFUL_RESULTS_KEY.format(
-                prefix=backend.key_prefix, queue_name="default"
+            successful_key = backend._segment_key(
+                TaskResultStatus.SUCCESSFUL, "default"
             )
-            failed_key = backend.FAILED_RESULTS_KEY.format(
-                prefix=backend.key_prefix, queue_name="default"
-            )
+            failed_key = backend._segment_key(TaskResultStatus.FAILED, "default")
             old = (timezone.now() - datetime.timedelta(seconds=120)).timestamp() * 1000
             backend.client.zadd(ingress_key, {task_result.id: old})
             backend.client.zadd(successful_key, {task_result.id: old})
@@ -138,9 +136,7 @@ class TestRedisTaskBackend:
             assert acquired.id == task_result.id
 
             # Verify task is in running set, not in any processing set
-            running_key = backend.RUNNING_KEY.format(
-                prefix=backend.key_prefix, queue_name="default"
-            )
+            running_key = backend._segment_key(TaskResultStatus.RUNNING, "default")
             assert backend.client.zscore(running_key, task_result.id) is not None
 
             # Verify task data was updated with worker info
@@ -401,12 +397,10 @@ class TestRedisTaskBackend:
             },
         )
         try:
-            successful_key = backend.SUCCESSFUL_RESULTS_KEY.format(
-                prefix=backend.key_prefix, queue_name="default"
+            successful_key = backend._segment_key(
+                TaskResultStatus.SUCCESSFUL, "default"
             )
-            failed_key = backend.FAILED_RESULTS_KEY.format(
-                prefix=backend.key_prefix, queue_name="default"
-            )
+            failed_key = backend._segment_key(TaskResultStatus.FAILED, "default")
 
             def _ack(status: TaskResultStatus) -> str:
                 enqueued = backend.enqueue(echo, args=[1])
@@ -472,8 +466,8 @@ class TestRedisTaskBackend:
             ingress_key = backend.INGRESS_KEY.format(
                 prefix=backend.key_prefix, queue_name="default"
             )
-            successful_results_key = backend.SUCCESSFUL_RESULTS_KEY.format(
-                prefix=backend.key_prefix, queue_name="default"
+            successful_results_key = backend._segment_key(
+                TaskResultStatus.SUCCESSFUL, "default"
             )
             old = (timezone.now() - datetime.timedelta(seconds=120)).timestamp() * 1000
             backend.client.zadd(ingress_key, {task_result.id: old})
@@ -556,8 +550,8 @@ class TestRedisTaskBackend:
                     finished_at=timezone.now(),
                 )
             )
-            successful_key = backend.SUCCESSFUL_RESULTS_KEY.format(
-                prefix=backend.key_prefix, queue_name="default"
+            successful_key = backend._segment_key(
+                TaskResultStatus.SUCCESSFUL, "default"
             )
 
             # Inside result_ttl (60s) but outside a 10s display window.
@@ -720,9 +714,7 @@ class TestRedisTaskBackend:
             run_after = timezone.now() + datetime.timedelta(seconds=10)
             backend.requeue(failed, run_after)
 
-            running_key = backend.RUNNING_KEY.format(
-                prefix=backend.key_prefix, queue_name="default"
-            )
+            running_key = backend._segment_key(TaskResultStatus.RUNNING, "default")
             deferred_key = backend.DEFERRED_KEY.format(
                 prefix=backend.key_prefix, queue_name="default"
             )
@@ -830,5 +822,223 @@ class TestRedisTaskBackend:
             )
             assert re_acquired is not None
             assert re_acquired.id == task_result.id
+        finally:
+            backend.close()
+
+    def test_requeue__cleans_up_failed_and_result_keys(self) -> None:
+        """requeue() removes the task from the failed zset and deletes its result key."""
+        backend = RedisTaskBackend(
+            "requeue_cleanup_test",
+            {
+                "QUEUES": ["default"],
+                "REDIS_URL": "redis://localhost:6379/0",
+                "OPTIONS": {
+                    "lease_ttl": datetime.timedelta(hours=1),
+                    "result_ttl": datetime.timedelta(seconds=60),
+                },
+            },
+        )
+        try:
+            backend.enqueue(echo, args=[1])
+            acquired = backend.acquire(
+                timeout=datetime.timedelta(seconds=1), worker="cleanup-test"
+            )
+            assert acquired is not None
+            backend.acknowledge(
+                dataclasses.replace(
+                    acquired,
+                    status=TaskResultStatus.FAILED,
+                    finished_at=timezone.now(),
+                )
+            )
+            failed = next(
+                backend.peek(
+                    queue_name="default", status=TaskResultStatus.FAILED, count=10
+                )
+            )
+            failed_key = backend._segment_key(TaskResultStatus.FAILED, "default")
+            result_key = backend.RESULT_KEY.format(
+                prefix=backend.key_prefix, result_id=failed.id
+            )
+            assert backend.client.zscore(failed_key, failed.id) is not None
+            assert backend.client.exists(result_key)
+
+            backend.requeue(failed, timezone.now() + datetime.timedelta(seconds=10))
+
+            assert backend.client.zscore(failed_key, failed.id) is None
+            assert not backend.client.exists(result_key)
+        finally:
+            backend.close()
+
+    def test_dequeue__removes_ready_task_from_queue(self) -> None:
+        """dequeue() removes a ready task from the queue zset."""
+        backend = RedisTaskBackend(
+            "dequeue_ready_test",
+            {
+                "QUEUES": ["default"],
+                "REDIS_URL": "redis://localhost:6379/0",
+                "OPTIONS": {
+                    "lease_ttl": datetime.timedelta(hours=1),
+                    "result_ttl": datetime.timedelta(seconds=60),
+                },
+            },
+        )
+        try:
+            task_result = backend.enqueue(echo, args=[1])
+            queue_key = backend._segment_key(TaskResultStatus.READY, "default")
+            assert backend.client.zscore(queue_key, task_result.id) is not None
+
+            backend.dequeue(task_result)
+
+            assert backend.client.zscore(queue_key, task_result.id) is None
+        finally:
+            backend.close()
+
+    def test_dequeue__removes_failed_task_from_results(self) -> None:
+        """dequeue() removes a failed task from the failed zset."""
+        backend = RedisTaskBackend(
+            "dequeue_failed_test",
+            {
+                "QUEUES": ["default"],
+                "REDIS_URL": "redis://localhost:6379/0",
+                "OPTIONS": {
+                    "lease_ttl": datetime.timedelta(hours=1),
+                    "result_ttl": datetime.timedelta(seconds=60),
+                },
+            },
+        )
+        try:
+            backend.enqueue(echo, args=[1])
+            acquired = backend.acquire(
+                timeout=datetime.timedelta(seconds=1), worker="dequeue-failed-test"
+            )
+            assert acquired is not None
+            backend.acknowledge(
+                dataclasses.replace(
+                    acquired,
+                    status=TaskResultStatus.FAILED,
+                    finished_at=timezone.now(),
+                )
+            )
+            failed = next(
+                backend.peek(
+                    queue_name="default", status=TaskResultStatus.FAILED, count=10
+                )
+            )
+            failed_key = backend._segment_key(TaskResultStatus.FAILED, "default")
+
+            backend.dequeue(failed)
+
+            assert backend.client.zscore(failed_key, failed.id) is None
+        finally:
+            backend.close()
+
+    def test_purge__removes_all_tasks_across_segments(self) -> None:
+        """purge_queue() deletes every task across all segments."""
+        backend = RedisTaskBackend(
+            "purge_test",
+            {
+                "QUEUES": ["default"],
+                "REDIS_URL": "redis://localhost:6379/0",
+                "OPTIONS": {
+                    "lease_ttl": datetime.timedelta(hours=1),
+                    "result_ttl": datetime.timedelta(seconds=60),
+                },
+            },
+        )
+        try:
+            # Two ready tasks
+            backend.enqueue(echo, args=[1])
+            backend.enqueue(echo, args=[2])
+            # One running task
+            backend.acquire(timeout=datetime.timedelta(seconds=1), worker="purge-test")
+            # One failed task
+            backend.enqueue(echo, args=[3])
+            acquired = backend.acquire(
+                timeout=datetime.timedelta(seconds=1), worker="purge-test-2"
+            )
+            assert acquired is not None
+            backend.acknowledge(
+                dataclasses.replace(
+                    acquired,
+                    status=TaskResultStatus.FAILED,
+                    finished_at=timezone.now(),
+                )
+            )
+            # One successful task
+            backend.enqueue(echo, args=[4])
+            acquired = backend.acquire(
+                timeout=datetime.timedelta(seconds=1), worker="purge-test-3"
+            )
+            assert acquired is not None
+            backend.acknowledge(
+                dataclasses.replace(
+                    acquired,
+                    status=TaskResultStatus.SUCCESSFUL,
+                    finished_at=timezone.now(),
+                )
+            )
+
+            backend.purge("default")
+            assert (
+                list(
+                    backend.peek(
+                        queue_name="default", status=TaskResultStatus.READY, count=10
+                    )
+                )
+                == []
+            )
+            assert (
+                list(
+                    backend.peek(
+                        queue_name="default", status=TaskResultStatus.RUNNING, count=10
+                    )
+                )
+                == []
+            )
+            assert (
+                list(
+                    backend.peek(
+                        queue_name="default", status=TaskResultStatus.FAILED, count=10
+                    )
+                )
+                == []
+            )
+            assert (
+                list(
+                    backend.peek(
+                        queue_name="default",
+                        status=TaskResultStatus.SUCCESSFUL,
+                        count=10,
+                    )
+                )
+                == []
+            )
+        finally:
+            backend.close()
+
+    def test_purge__empty_queue_is_noop(self) -> None:
+        """purge_queue() on an empty queue is a no-op."""
+        backend = RedisTaskBackend(
+            "purge_empty_test",
+            {
+                "QUEUES": ["default"],
+                "REDIS_URL": "redis://localhost:6379/0",
+                "OPTIONS": {
+                    "lease_ttl": datetime.timedelta(hours=1),
+                    "result_ttl": datetime.timedelta(seconds=60),
+                },
+            },
+        )
+        try:
+            backend.purge("default")
+            assert (
+                list(
+                    backend.peek(
+                        queue_name="default", status=TaskResultStatus.READY, count=10
+                    )
+                )
+                == []
+            )
         finally:
             backend.close()

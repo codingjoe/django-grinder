@@ -7,7 +7,7 @@
 --                KEYS[4] = queue, etc.
 -- ARGV[1]     -- current time in milliseconds
 -- ARGV[2]     -- current time as ISO-8601 string
--- ARGV[3]     -- task key prefix (e.g. "threadmill:default:task:")
+-- ARGV[3]     -- task key prefix (e.g. "threadmill:task:")
 -- ARGV[4]     -- number of queue pairs (N/2)
 -- ARGV[5]     -- worker name
 -- ARGV[6]     -- lease TTL in milliseconds
