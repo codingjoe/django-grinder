@@ -55,14 +55,12 @@ class RedisBroker(Broker):
         deferred_key = self.backend.DEFERRED_KEY.format(
             prefix=self.backend.key_prefix, queue_name=queue_name
         )
-        queue_key = self.backend.QUEUE_KEY.format(
-            prefix=self.backend.key_prefix, queue_name=queue_name
-        )
+        queue_key = self.backend._segment_key(TaskResultStatus.READY, queue_name)
         self._mover_script(
             keys=[deferred_key, queue_key],
             args=[
                 str(time.time() * 1000),
-                self.backend.key_prefix + ":task:",
+                f"{self.backend.key_prefix}:task:",
                 str(self.backend.batch_size),
             ],
         )
@@ -72,18 +70,16 @@ class RedisBroker(Broker):
         now = timezone.now()
         now_ms = now.timestamp() * 1000
         finished_at_iso = now.isoformat()
-        running_key = self.backend.RUNNING_KEY.format(
-            prefix=self.backend.key_prefix, queue_name=queue_name
-        )
-        failed_results_key = self.backend.FAILED_RESULTS_KEY.format(
-            prefix=self.backend.key_prefix, queue_name=queue_name
+        running_key = self.backend._segment_key(TaskResultStatus.RUNNING, queue_name)
+        failed_results_key = self.backend._segment_key(
+            TaskResultStatus.FAILED, queue_name
         )
         self._reaper_script(
             keys=[running_key, failed_results_key],
             args=[
                 str(now_ms),
-                self.backend.key_prefix + ":task:",
-                self.backend.key_prefix + ":result:",
+                f"{self.backend.key_prefix}:task:",
+                f"{self.backend.key_prefix}:result:",
                 str(self.backend.batch_size),
                 str(int(self.backend.result_ttl.total_seconds())),
                 finished_at_iso,
@@ -125,19 +121,24 @@ class RedisTaskBackend(ThreadmillTaskBackend):
 
     broker_class = RedisBroker
 
-    QUEUE_KEY = "{prefix}:queue:{queue_name}"
-    RUNNING_KEY = "{prefix}:running:{queue_name}"
-    DEFERRED_KEY = "{prefix}:deferred:{queue_name}"
     TASK_KEY = "{prefix}:task:{task_id}"
     RESULT_KEY = "{prefix}:result:{result_id}"
-    SUCCESSFUL_RESULTS_KEY = "{prefix}:results:{queue_name}:successful"
-    FAILED_RESULTS_KEY = "{prefix}:results:{queue_name}:failed"
-    INGRESS_KEY = "{prefix}:ingress:{queue_name}:events"
+    SEGMENT_KEY = "{prefix}:{queue_name}:{status}"
+    DEFERRED_KEY = "{prefix}:{queue_name}:deferred"
+
+    INGRESS_KEY = "{prefix}:{queue_name}:ingress:events"
 
     ACQUIRE_SCRIPT = _load_lua("acquire")
     """Pop the next task from a priority queue and move it directly to the running set."""
     ACKNOWLEDGE_SCRIPT = _load_lua("acknowledge")
     """Remove from running, persist the result, and clean up."""
+
+    def _segment_key(self, status: TaskResultStatus, queue_name: str) -> str:
+        return self.SEGMENT_KEY.format(
+            prefix=self.key_prefix,
+            queue_name=queue_name,
+            status=status.value.lower(),
+        )
 
     def __init__(self, alias: str, params: dict) -> None:
         super().__init__(alias=alias, params=params)
@@ -224,9 +225,7 @@ class RedisTaskBackend(ThreadmillTaskBackend):
             run_after_ms = task.run_after.timestamp() * 1000
             pipe.zadd(deferred_key, {task_result.id: run_after_ms})
         else:
-            queue_key = self.QUEUE_KEY.format(
-                prefix=self.key_prefix, queue_name=task.queue_name
-            )
+            queue_key = self._segment_key(TaskResultStatus.READY, task.queue_name)
             pipe.zadd(queue_key, {task_result.id: score})
 
         pipe.execute()
@@ -246,8 +245,8 @@ class RedisTaskBackend(ThreadmillTaskBackend):
             key
             for queue_name in queue_names
             for key in (
-                self.RUNNING_KEY.format(prefix=self.key_prefix, queue_name=queue_name),
-                self.QUEUE_KEY.format(prefix=self.key_prefix, queue_name=queue_name),
+                self._segment_key(TaskResultStatus.RUNNING, queue_name),
+                self._segment_key(TaskResultStatus.READY, queue_name),
             )
         ]
 
@@ -261,7 +260,7 @@ class RedisTaskBackend(ThreadmillTaskBackend):
                 args=[
                     str(now_ms),
                     now_iso,
-                    self.key_prefix + ":task:",
+                    f"{self.key_prefix}:task:",
                     str(len(queue_names)),
                     worker,
                     str(int(self.lease_ttl.total_seconds() * 1000)),
@@ -281,18 +280,18 @@ class RedisTaskBackend(ThreadmillTaskBackend):
 
     def acknowledge(self, task_result: TaskResult) -> None:
         serialized = self.serialize_task_result(task_result)
-        running_key = self.RUNNING_KEY.format(
-            prefix=self.key_prefix, queue_name=task_result.task.queue_name
+        running_key = self._segment_key(
+            TaskResultStatus.RUNNING, task_result.task.queue_name
         )
         result_key = self.RESULT_KEY.format(
             prefix=self.key_prefix, result_id=task_result.id
         )
         task_key = self.TASK_KEY.format(prefix=self.key_prefix, task_id=task_result.id)
-        successful_results_key = self.SUCCESSFUL_RESULTS_KEY.format(
-            prefix=self.key_prefix, queue_name=task_result.task.queue_name
+        successful_results_key = self._segment_key(
+            TaskResultStatus.SUCCESSFUL, task_result.task.queue_name
         )
-        failed_results_key = self.FAILED_RESULTS_KEY.format(
-            prefix=self.key_prefix, queue_name=task_result.task.queue_name
+        failed_results_key = self._segment_key(
+            TaskResultStatus.FAILED, task_result.task.queue_name
         )
         finished_at = task_result.finished_at or timezone.now()
         finish_score = finished_at.timestamp() * 1000
@@ -322,13 +321,19 @@ class RedisTaskBackend(ThreadmillTaskBackend):
             finished_at=None,
         )
         serialized = self.serialize_task_result(task_result)
-        running_key = self.RUNNING_KEY.format(
-            prefix=self.key_prefix, queue_name=task_result.task.queue_name
+        running_key = self._segment_key(
+            TaskResultStatus.RUNNING, task_result.task.queue_name
         )
         deferred_key = self.DEFERRED_KEY.format(
             prefix=self.key_prefix, queue_name=task_result.task.queue_name
         )
+        failed_key = self._segment_key(
+            TaskResultStatus.FAILED, task_result.task.queue_name
+        )
         task_key = self.TASK_KEY.format(prefix=self.key_prefix, task_id=task_result.id)
+        result_key = self.RESULT_KEY.format(
+            prefix=self.key_prefix, result_id=task_result.id
+        )
         score = self._compute_score(task_result.task.priority, task_result.enqueued_at)
         run_after_ms = run_after.timestamp() * 1000
         task_data_ttl = int(
@@ -337,9 +342,24 @@ class RedisTaskBackend(ThreadmillTaskBackend):
 
         pipe = self.client.pipeline()
         pipe.zrem(running_key, task_result.id)
+        pipe.zrem(failed_key, task_result.id)
+        pipe.delete(result_key)
         pipe.hset(task_key, mapping={"data": serialized, "score": str(score)})
         pipe.expire(task_key, task_data_ttl)
         pipe.zadd(deferred_key, {task_result.id: run_after_ms})
+        pipe.execute()
+
+    def dequeue(self, task_result: TaskResult) -> None:
+        self.client.zrem(
+            self._segment_key(task_result.status, task_result.task.queue_name),
+            task_result.id,
+        )
+
+    def purge(self, queue_name: str) -> None:
+        pattern = f"{self.key_prefix}:{queue_name}:*"
+        pipe = self.client.pipeline()
+        for key in self.client.scan_iter(match=pattern):
+            pipe.delete(key)
         pipe.execute()
 
     def peek(
@@ -350,34 +370,27 @@ class RedisTaskBackend(ThreadmillTaskBackend):
         count: int = 1,
     ) -> Generator[TaskResult]:
         match status:
-            case TaskResultStatus.READY:
+            case TaskResultStatus.READY | TaskResultStatus.RUNNING:
                 yield from self._peek(
-                    self.QUEUE_KEY, self.TASK_KEY, queue_name, count, "data"
+                    self._segment_key(status, queue_name),
+                    self.TASK_KEY,
+                    count,
+                    "data",
                 )
-            case TaskResultStatus.RUNNING:
+            case TaskResultStatus.SUCCESSFUL | TaskResultStatus.FAILED:
                 yield from self._peek(
-                    self.RUNNING_KEY, self.TASK_KEY, queue_name, count, "data"
-                )
-            case TaskResultStatus.SUCCESSFUL:
-                yield from self._peek(
-                    self.SUCCESSFUL_RESULTS_KEY, self.RESULT_KEY, queue_name, count
-                )
-            case TaskResultStatus.FAILED:
-                yield from self._peek(
-                    self.FAILED_RESULTS_KEY, self.RESULT_KEY, queue_name, count
+                    self._segment_key(status, queue_name),
+                    self.RESULT_KEY,
+                    count,
                 )
 
     def _peek(
         self,
-        zset_key_template: str,
+        zset_key: str,
         data_key_template: str,
-        queue_name: str,
         count: int,
         field: str | None = None,
     ) -> Generator[TaskResult]:
-        zset_key = zset_key_template.format(
-            prefix=self.key_prefix, queue_name=queue_name
-        )
         pipe = self.client.pipeline()
         for member in self.client.zrange(zset_key, 0, count - 1):
             member_id = member.decode() if isinstance(member, bytes) else member
@@ -412,16 +425,12 @@ class RedisTaskBackend(ThreadmillTaskBackend):
             cutoff,
         )
         pipe.zremrangebyscore(
-            self.SUCCESSFUL_RESULTS_KEY.format(
-                prefix=self.key_prefix, queue_name=queue_name
-            ),
+            self._segment_key(TaskResultStatus.SUCCESSFUL, queue_name),
             0,
             cutoff,
         )
         pipe.zremrangebyscore(
-            self.FAILED_RESULTS_KEY.format(
-                prefix=self.key_prefix, queue_name=queue_name
-            ),
+            self._segment_key(TaskResultStatus.FAILED, queue_name),
             0,
             cutoff,
         )
@@ -436,21 +445,15 @@ class RedisTaskBackend(ThreadmillTaskBackend):
         retention_start_ms = now_ms - self.result_ttl.total_seconds() * 1000
         pipe = self.client.pipeline()
         for queue_name in self.queues:
-            pipe.zcard(
-                self.QUEUE_KEY.format(prefix=self.key_prefix, queue_name=queue_name)
-            )
-            pipe.zcard(
-                self.RUNNING_KEY.format(prefix=self.key_prefix, queue_name=queue_name)
-            )
+            pipe.zcard(self._segment_key(TaskResultStatus.READY, queue_name))
+            pipe.zcard(self._segment_key(TaskResultStatus.RUNNING, queue_name))
             pipe.zcard(
                 self.DEFERRED_KEY.format(prefix=self.key_prefix, queue_name=queue_name)
             )
-            successful_results_key = self.SUCCESSFUL_RESULTS_KEY.format(
-                prefix=self.key_prefix, queue_name=queue_name
+            successful_results_key = self._segment_key(
+                TaskResultStatus.SUCCESSFUL, queue_name
             )
-            failed_results_key = self.FAILED_RESULTS_KEY.format(
-                prefix=self.key_prefix, queue_name=queue_name
-            )
+            failed_results_key = self._segment_key(TaskResultStatus.FAILED, queue_name)
             pipe.zcard(successful_results_key)
             pipe.zcard(failed_results_key)
             ingress_key = self.INGRESS_KEY.format(

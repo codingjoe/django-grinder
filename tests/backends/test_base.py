@@ -86,6 +86,16 @@ class TestThreadmillTaskBackend:
         with pytest.raises(NotImplementedError):
             BackendDouble(alias="default", params={}).telemetry()
 
+    def test_dequeue__raise_not_implemented_error(self) -> None:
+        """Raise NotImplementedError for backend dequeue API."""
+        with pytest.raises(NotImplementedError):
+            BackendDouble(alias="default", params={}).dequeue(task_result=None)
+
+    def test_purge__raise_not_implemented_error(self) -> None:
+        """Raise NotImplementedError for backend purge_queue API."""
+        with pytest.raises(NotImplementedError):
+            BackendDouble(alias="default", params={}).purge("default")
+
     def test_validate_task__accepts_module_level_function(self) -> None:
         """validate_task accepts a module-level retry callback."""
         backend = BackendDouble(alias="default", params={})
