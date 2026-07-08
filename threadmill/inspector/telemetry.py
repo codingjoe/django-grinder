@@ -11,14 +11,7 @@ WINDOW_SECONDS = 60
 
 
 class TelemetryBuffer:
-    """Per-(queue, direction) rolling 60-second count buffer.
-
-    Events arrive as :class:`TelemetryEvent` instances from the backend's
-    pub/sub stream and are bucketed by receipt time so worker clock skew
-    can't distort the series.  Each direction's time buckets are stored in
-    an :class:`~collections.OrderedDict` keyed by integer second; stale
-    buckets are evicted LRU-style from the front in O(1).
-    """
+    """Per-(queue, direction) rolling 60-second count buffer."""
 
     def __init__(self, *, window: int = WINDOW_SECONDS) -> None:
         self._window = window
