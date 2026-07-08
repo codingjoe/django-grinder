@@ -288,15 +288,14 @@ class TaskList(Vertical):
             )
 
     def _do_requeue(self, confirmed: bool, task: TaskResult) -> None:
-        if not confirmed:
-            return
-        try:
-            self.backend.requeue(task, datetime.datetime.now(datetime.UTC))
-        except Exception:  # noqa: BLE001
-            logger.exception("Requeue failed for task %s", task.id)
-            self.app.notify("Requeue failed.", severity="error")
-            return
-        self.app._after_action("Task requeued.")
+        if confirmed:
+            try:
+                self.backend.requeue(task, datetime.datetime.now(datetime.UTC))
+            except Exception:  # noqa: BLE001
+                logger.exception("Requeue failed for task %s", task.id)
+                self.app.notify("Requeue failed.", severity="error")
+            else:
+                self.app._after_action("Task requeued.")
 
     def action_dequeue(self) -> None:
         """Remove the selected task from its current segment after confirmation."""
@@ -311,15 +310,14 @@ class TaskList(Vertical):
             )
 
     def _do_dequeue(self, confirmed: bool, task: TaskResult) -> None:
-        if not confirmed:
-            return
-        try:
-            self.backend.dequeue(task)
-        except Exception:  # noqa: BLE001
-            logger.exception("Delete failed for task %s", task.id)
-            self.app.notify("Delete failed.", severity="error")
-            return
-        self.app._after_action("Task deleted.")
+        if confirmed:
+            try:
+                self.backend.dequeue(task)
+            except Exception:  # noqa: BLE001
+                logger.exception("Delete failed for task %s", task.id)
+                self.app.notify("Delete failed.", severity="error")
+            else:
+                self.app._after_action("Task deleted.")
 
     def _refresh_data(self) -> None:
         """Fetch and display tasks for the current queue and active tab."""
@@ -426,24 +424,22 @@ class QueueList(ListView):
 
     def action_purge(self) -> None:
         item = self.highlighted_child
-        if not isinstance(item, QueueItem):
-            return
-        queue_name = item.queue_name
-        self.app.push_screen(
-            PurgeScreen(queue_name),
-            lambda confirmed: self._do_purge(confirmed, queue_name),
-        )
+        if isinstance(item, QueueItem):
+            queue_name = item.queue_name
+            self.app.push_screen(
+                PurgeScreen(queue_name),
+                lambda confirmed: self._do_purge(confirmed, queue_name),
+            )
 
     def _do_purge(self, confirmed: bool, queue_name: str) -> None:
-        if not confirmed:
-            return
-        try:
-            self.app.backend.purge(queue_name)
-        except Exception:  # noqa: BLE001
-            logger.exception("Purge failed for %r", queue_name)
-            self.app.notify("Purge failed.", severity="error")
-            return
-        self.app._after_action(f"Purged queue {queue_name}.")
+        if confirmed:
+            try:
+                self.app.backend.purge(queue_name)
+            except Exception:  # noqa: BLE001
+                logger.exception("Purge failed for %r", queue_name)
+                self.app.notify("Purge failed.", severity="error")
+            else:
+                self.app._after_action(f"Purged queue {queue_name}.")
 
 
 class InspectorApp(App):
@@ -582,13 +578,15 @@ class InspectorApp(App):
             telemetry = await self.backend.queue_stats()
         except Exception:  # noqa: BLE001
             logger.exception("Failed to refresh queue stats")
-            return
-        queue_name = self._task_list.queue_name
-        if queue_name and queue_name in telemetry.queues:
-            live_rates = self.telemetry_buffer.rates_for(queue_name)
-            stats = telemetry.queues[queue_name]
-            telemetry.queues[queue_name] = dataclasses.replace(stats, rates=live_rates)
-        self.telemetry = telemetry
+        else:
+            queue_name = self._task_list.queue_name
+            if queue_name and queue_name in telemetry.queues:
+                live_rates = self.telemetry_buffer.rates_for(queue_name)
+                stats = telemetry.queues[queue_name]
+                telemetry.queues[queue_name] = dataclasses.replace(
+                    stats, rates=live_rates
+                )
+            self.telemetry = telemetry
 
     def _refresh_sparklines(self) -> None:
         """Push the latest 60-second rolling series into the ingress/egress sparklines."""
@@ -617,11 +615,11 @@ class InspectorApp(App):
             if asyncio.iscoroutine(stream):
                 stream = await stream
         except NotImplementedError:
-            return
-        if stream is None:
-            return
-        try:
-            async for event in stream:
-                self.telemetry_buffer.record(event, now=time.monotonic())
-        except asyncio.CancelledError:
-            raise
+            pass
+        else:
+            if stream is not None:
+                try:
+                    async for event in stream:
+                        self.telemetry_buffer.record(event, now=time.monotonic())
+                except asyncio.CancelledError:
+                    raise
