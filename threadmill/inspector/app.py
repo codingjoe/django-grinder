@@ -34,17 +34,21 @@ from textual.widgets import (
     TabPane,
 )
 
-from ..backends.base import BackendTelemetry, ThreadmillTaskBackend
+from ..backends.base import (
+    BackendTelemetry,
+    TelemetryDirection,
+    ThreadmillTaskBackend,
+)
 from .screens import ConfirmScreen, PurgeScreen
 from .telemetry import TelemetryBuffer
 
 logger = logging.getLogger(__name__)
 
-TELEMETRY_INTERVAL_SECONDS = 2.0
-"""Seconds between automatic queue-stat refreshes; the task list stays manual."""
+TELEMETRY_INTERVAL = datetime.timedelta(seconds=2)
+"""Between automatic queue-stat refreshes; the task list stays manual."""
 
-SPARKLINE_INTERVAL_SECONDS = 1.0
-"""Seconds between sparkline refreshes from the rolling telemetry buffer."""
+SPARKLINE_INTERVAL = datetime.timedelta(seconds=1)
+"""Between sparkline refreshes from the rolling telemetry buffer."""
 
 TAB_STATUSES: list[tuple[str, TaskResultStatus | None]] = [
     ("Running", TaskResultStatus.RUNNING),
@@ -239,7 +243,7 @@ class TaskList(Vertical):
 
     def action_refresh(self) -> None:
         """Refresh telemetry and re-fetch the task list."""
-        self.app._refresh_telemetry()
+        self.app._poll_queue_stats()
         self.refresh_tasks()
 
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
@@ -468,7 +472,6 @@ class InspectorApp(App):
         self._task_list: TaskList | None = None
         self._task_detail: TaskDetail | None = None
         self._options_static: Static | None = None
-        self._telemetry_timer = None
         self._sparkline_timer = None
         self._auto_refresh = auto_refresh
         self.telemetry_buffer = TelemetryBuffer()
@@ -516,16 +519,11 @@ class InspectorApp(App):
         self._task_detail = self.query_one("#task-detail", TaskDetail)
         self._options_static = self.query_one("#backend-options", Static)
         self._refresh_options()
-        self._refresh_telemetry()
+        self._poll_queue_stats()
         self._listen_telemetry()
         if self._auto_refresh:
-            self._telemetry_timer = self.set_interval(
-                TELEMETRY_INTERVAL_SECONDS,
-                self._refresh_telemetry,
-                name="telemetry-refresh",
-            )
             self._sparkline_timer = self.set_interval(
-                SPARKLINE_INTERVAL_SECONDS,
+                SPARKLINE_INTERVAL.total_seconds(),
                 self._refresh_sparklines,
                 name="sparkline-refresh",
             )
@@ -538,7 +536,7 @@ class InspectorApp(App):
     def _after_action(self, message: str) -> None:
         """Refresh telemetry and tasks after a mutating queue action."""
         self.notify(message)
-        self._refresh_telemetry()
+        self._poll_queue_stats()
         self._task_list.refresh_tasks()
 
     def action_switch_tab(self, tab_id: str) -> None:
@@ -547,7 +545,7 @@ class InspectorApp(App):
 
     def watch_backend(self) -> None:
         self._refresh_options()
-        self._refresh_telemetry()
+        self._poll_queue_stats()
         self._listen_telemetry()
 
     def on_select_changed(self, event: Select.Changed) -> None:
@@ -575,19 +573,30 @@ class InspectorApp(App):
         ]
         self._options_static.update(" ".join(parts) or "No options")
 
-    def _refresh_telemetry(self) -> None:
-        """Poll the backend for counts and merge live pub/sub rates for the selected queue."""
-        try:
-            telemetry = self.backend.telemetry()
-        except Exception:  # noqa: BLE001
-            logger.exception("Failed to refresh telemetry")
-            return
-        queue_name = self._task_list.queue_name
-        if queue_name and queue_name in telemetry.queues:
-            live_rates = self.telemetry_buffer.rates_for(queue_name)
-            stats = telemetry.queues[queue_name]
-            telemetry.queues[queue_name] = dataclasses.replace(stats, rates=live_rates)
-        self.telemetry = telemetry
+    @work(exclusive=True, group="queue-stats")
+    async def _poll_queue_stats(self) -> None:
+        """Poll the backend for counts and merge live pub/sub rates.
+
+        Runs as a textual worker so the synchronous ``queue_stats`` call is
+        offloaded via :func:`asyncio.to_thread`, keeping the UI thread free.
+        The worker loops until cancelled, sleeping ``TELEMETRY_INTERVAL``
+        between refreshes.
+        """
+        while True:
+            try:
+                telemetry = await asyncio.to_thread(self.backend.queue_stats)
+            except Exception:  # noqa: BLE001
+                logger.exception("Failed to refresh queue stats")
+            else:
+                queue_name = self._task_list.queue_name
+                if queue_name and queue_name in telemetry.queues:
+                    live_rates = self.telemetry_buffer.rates_for(queue_name)
+                    stats = telemetry.queues[queue_name]
+                    telemetry.queues[queue_name] = dataclasses.replace(
+                        stats, rates=live_rates
+                    )
+                self.telemetry = telemetry
+            await asyncio.sleep(TELEMETRY_INTERVAL.total_seconds())
 
     def _refresh_sparklines(self) -> None:
         """Push the latest 60-second rolling series into the ingress/egress sparklines."""
@@ -596,12 +605,14 @@ class InspectorApp(App):
         egress = self.query_one("#egress-sparkline", Sparkline)
         now = time.monotonic()
         ingress.data = (
-            self.telemetry_buffer.series(queue_name, "ingress", now=now)
+            self.telemetry_buffer.series(
+                queue_name, TelemetryDirection.INGRESS, now=now
+            )
             if queue_name
             else [0.0] * 60
         )
         egress.data = (
-            self.telemetry_buffer.series(queue_name, "egress", now=now)
+            self.telemetry_buffer.series(queue_name, TelemetryDirection.EGRESS, now=now)
             if queue_name
             else [0.0] * 60
         )
@@ -609,11 +620,11 @@ class InspectorApp(App):
     @work(exclusive=True, group="telemetry")
     async def _listen_telemetry(self) -> None:
         """Subscribe to the backend's pub/sub telemetry stream and feed the buffer."""
-        stream = self.backend.subscribe_telemetry()
+        stream = self.backend.worker_telemetry()
         if stream is None:
             return
         try:
-            async for payload in stream:
-                self.telemetry_buffer.record(payload, now=time.monotonic())
+            async for event in stream:
+                self.telemetry_buffer.record(event, now=time.monotonic())
         except asyncio.CancelledError:
             raise

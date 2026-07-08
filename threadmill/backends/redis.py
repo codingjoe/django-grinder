@@ -23,6 +23,8 @@ from threadmill.backends.base import (
     QueueCounts,
     QueueRates,
     QueueStats,
+    TelemetryDirection,
+    TelemetryEvent,
     ThreadmillTaskBackend,
 )
 
@@ -85,8 +87,6 @@ class RedisBroker(Broker):
                 str(self.backend.batch_size),
                 str(int(self.backend.result_ttl.total_seconds())),
                 finished_at_iso,
-                self.backend.telemetry_channel,
-                queue_name,
             ],
         )
 
@@ -345,6 +345,7 @@ class RedisTaskBackend(ThreadmillTaskBackend):
         pipe.hset(task_key, mapping={"data": serialized, "score": str(score)})
         pipe.expire(task_key, task_data_ttl)
         pipe.zadd(deferred_key, {task_result.id: run_after_ms})
+        pipe.publish(self.telemetry_channel, f"ingress:{task_result.task.queue_name}")
         pipe.execute()
 
     def dequeue(self, task_result: TaskResult) -> None:
@@ -414,13 +415,13 @@ class RedisTaskBackend(ThreadmillTaskBackend):
             return self.deserialize_task_result(data)
         raise TaskResultDoesNotExist(f"Task result {result_id!r} does not exist.")
 
-    def telemetry(
+    def queue_stats(
         self, *, interval: datetime.timedelta = datetime.timedelta(seconds=60)
     ) -> BackendTelemetry:
         """Return point-in-time counts for all configured queues.
 
         Rates are zero here; live throughput arrives via pub/sub on
-        :meth:`subscribe_telemetry` and is assembled by the inspector.
+        :meth:`subscribe_telemetry_events` and is assembled by the inspector.
         """
         pipe = self.client.pipeline()
         for queue_name in self.queues:
@@ -448,16 +449,18 @@ class RedisTaskBackend(ThreadmillTaskBackend):
             )
         return BackendTelemetry(queues=queues)
 
-    def subscribe_telemetry(self) -> collections.abc.AsyncIterator[str] | None:
+    def worker_telemetry(
+        self,
+    ) -> collections.abc.AsyncIterator[TelemetryEvent] | None:
         """Subscribe to the backend's telemetry pub/sub channel.
 
-        Yields decoded ``"{direction}:{queue_name}"`` payloads. The connection
+        Yields structured :class:`TelemetryEvent` instances. The connection
         is opened with the asyncio client so the inspector can consume it off
         the UI thread.
         """
         return self._telemetry_stream()
 
-    async def _telemetry_stream(self) -> collections.abc.AsyncIterator[str]:
+    async def _telemetry_stream(self) -> collections.abc.AsyncIterator[TelemetryEvent]:
         client = redis.asyncio.Redis.from_url(self.redis_url)
         pubsub = client.pubsub()
         await pubsub.subscribe(self.telemetry_channel)
@@ -466,11 +469,20 @@ class RedisTaskBackend(ThreadmillTaskBackend):
                 ignore_subscribe_messages=True, timeout=None
             ):
                 if (data := message.get("data")) is not None:
-                    yield data.decode() if isinstance(data, bytes) else data
+                    payload = data.decode() if isinstance(data, bytes) else data
+                    yield self._parse_telemetry_payload(payload)
         finally:
             await pubsub.unsubscribe(self.telemetry_channel)
             await pubsub.aclose()
             await client.aclose()
+
+    @staticmethod
+    def _parse_telemetry_payload(payload: str) -> TelemetryEvent:
+        """Parse a ``"{direction}:{queue_name}"`` pub/sub payload."""
+        direction, _, queue_name = payload.partition(":")
+        return TelemetryEvent(
+            direction=TelemetryDirection(direction), queue_name=queue_name
+        )
 
     def close(self) -> None:
         """Close the Redis connection."""

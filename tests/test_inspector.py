@@ -37,7 +37,7 @@ from threadmill.inspector.screens import ConfirmScreen, PurgeScreen
 
 
 class FailingBackend(ThreadmillTaskBackend):
-    """Backend double whose peek and telemetry raise for error-path tests."""
+    """Backend double whose peek and queue_stats raise for error-path tests."""
 
     def enqueue(self, task, args, kwargs):
         raise NotImplementedError
@@ -45,8 +45,8 @@ class FailingBackend(ThreadmillTaskBackend):
     def peek(self, *args, **kwargs):
         raise RuntimeError("peek failed")
 
-    def telemetry(self, *, interval=None):
-        raise RuntimeError("telemetry failed")
+    def queue_stats(self, *, interval=None):
+        raise RuntimeError("queue_stats failed")
 
 
 class ErroringBackend(RedisTaskBackend):
@@ -250,7 +250,7 @@ class TestInspectorApp:
         app = InspectorApp(backend=default_task_backend, auto_refresh=False)
         async with app.run_test() as pilot:
             await pilot.pause()
-            app._refresh_telemetry()
+            app.telemetry = app.backend.queue_stats()
             await pilot.pause()
             queue_list = app.query_one("#queue-list", QueueList)
             assert set(queue_list._items) == set(default_task_backend.queues)
@@ -457,17 +457,17 @@ class TestInspectorApp:
             assert table.row_count >= 1
 
     async def test_auto_refresh_timer_armed(self):
-        """With auto-refresh on, a telemetry timer is armed on mount."""
+        """With auto-refresh on, the sparkline timer is armed on mount."""
         app = InspectorApp(backend=default_task_backend)
         async with app.run_test() as pilot:
             await pilot.pause()
             await pilot.pause()
-            assert app._telemetry_timer is not None
-            assert app._telemetry_timer.name == "telemetry-refresh"
+            assert app._sparkline_timer is not None
+            assert app._sparkline_timer.name == "sparkline-refresh"
         app = InspectorApp(backend=default_task_backend, auto_refresh=False)
         async with app.run_test() as pilot:
             await pilot.pause()
-            assert app._telemetry_timer is None
+            assert app._sparkline_timer is None
 
     async def test_initial_focus_on_queue_list(self):
         """The app opens with focus on the queue list, not the backend selector."""
@@ -495,7 +495,7 @@ class TestInspectorApp:
             default_task_backend.acquire(
                 timeout=datetime.timedelta(seconds=1), worker="stale-test"
             )
-            app.telemetry = app.backend.telemetry()
+            app.telemetry = app.backend.queue_stats()
             await pilot.pause()
             await pilot.pause()
             assert table.row_count == before

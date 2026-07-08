@@ -1,6 +1,7 @@
 import collections.abc
 import dataclasses
 import datetime
+import enum
 import json
 import threading
 import typing
@@ -93,6 +94,21 @@ class BackendTelemetry:
     """Snapshot of counts and rates across a backend's queues."""
 
     queues: dict[str, QueueStats]
+
+
+class TelemetryDirection(enum.Enum):
+    """Direction of a telemetry event: a task entering or leaving a queue."""
+
+    INGRESS = "ingress"
+    EGRESS = "egress"
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class TelemetryEvent:
+    """A single ingress/egress event published by a worker via pub/sub."""
+
+    direction: TelemetryDirection
+    queue_name: str
 
 
 class Broker(threading.Thread):
@@ -242,28 +258,21 @@ class ThreadmillTaskBackend(BaseTaskBackend, ABC):
         """
         raise NotImplementedError
 
-    def telemetry(
+    def queue_stats(
         self, *, interval: datetime.timedelta = datetime.timedelta(seconds=60)
     ) -> BackendTelemetry:
         """Return a snapshot of counts for all configured queues.
-
-        Rates are no longer populated by polling; live throughput arrives via
-        :meth:`subscribe_telemetry` for backends that support it.
 
         Args:
             interval: The rolling window the caller intends to display.
         """
         raise NotImplementedError
 
-    def subscribe_telemetry(self) -> collections.abc.AsyncIterator[str] | None:
-        """Yield telemetry events as ``"{direction}:{queue_name}"`` strings.
-
-        Backends without pub/sub support return ``None`` so the inspector can
-        fall back to counts-only telemetry. The returned async iterator is
-        consumed on the inspector's worker thread and must clean up its
-        subscription on close.
-        """
-        return None
+    def worker_telemetry(
+        self,
+    ) -> collections.abc.AsyncIterator[TelemetryEvent]:
+        """Yield structured telemetry events from the backend's pub/sub stream."""
+        raise NotImplementedError
 
     def dequeue(self, task_result: TaskResult) -> None:
         """Delete a single task from its current status segment."""

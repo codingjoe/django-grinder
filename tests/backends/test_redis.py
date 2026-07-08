@@ -174,8 +174,8 @@ class TestRedisTaskBackend:
             assert "AcknowledgementTimeout" in result.errors[0].exception_class_path
 
             # Reaping an expired task records a failed result. Live egress
-            # now arrives via pub/sub, so backend.telemetry() rates are zero.
-            stats = backend.telemetry().queues["default"]
+            # now arrives via pub/sub, so backend.queue_stats() rates are zero.
+            stats = backend.queue_stats().queues["default"]
             assert stats.rates.egress == 0
             assert stats.counts.failed == 1
             assert stats.counts.successful == 0
@@ -237,7 +237,7 @@ class TestRedisTaskBackend:
             },
         )
         try:
-            telemetry = backend.telemetry()
+            telemetry = backend.queue_stats()
             assert telemetry == BackendTelemetry(queues={"default": _stats()})
         finally:
             backend.close()
@@ -282,7 +282,7 @@ class TestRedisTaskBackend:
                 )
             )
 
-            telemetry = backend.telemetry()
+            telemetry = backend.queue_stats()
             assert telemetry.queues["default"] == _stats(
                 successful=1,
                 failed=1,
@@ -331,7 +331,7 @@ class TestRedisTaskBackend:
                 )
             )
 
-            stats = backend.telemetry().queues["default"]
+            stats = backend.queue_stats().queues["default"]
             # Rates come from the pub/sub buffer, not from Redis polling.
             assert stats.rates.ingress == 0
             assert stats.rates.egress == 0
@@ -387,7 +387,7 @@ class TestRedisTaskBackend:
 
             assert backend.client.zcard(successful_key) == 1
             assert backend.client.zcard(failed_key) == 1
-            stats = backend.telemetry().queues["default"]
+            stats = backend.queue_stats().queues["default"]
             assert stats.counts.successful == 1
             assert stats.counts.failed == 1
         finally:
@@ -473,15 +473,15 @@ class TestRedisTaskBackend:
             pubsub.close()
             backend.close()
 
-    def test_reaper__publishes_egress_telemetry(self):
-        """reaper.lua publishes an egress event per reaped task."""
+    def test_requeue__publishes_ingress_telemetry(self):
+        """requeue() publishes an ingress event for the re-queued task."""
         backend = RedisTaskBackend(
-            "telemetry_publish_reaper_test",
+            "telemetry_publish_requeue_test",
             {
                 "QUEUES": ["default"],
                 "REDIS_URL": "redis://localhost:6379/0",
                 "OPTIONS": {
-                    "lease_ttl": datetime.timedelta(seconds=1),
+                    "lease_ttl": datetime.timedelta(hours=1),
                     "result_ttl": datetime.timedelta(seconds=60),
                 },
             },
@@ -489,14 +489,19 @@ class TestRedisTaskBackend:
         pubsub = backend.client.pubsub()
         try:
             backend.enqueue(echo, args=[1])
-            backend.acquire(
-                timeout=datetime.timedelta(seconds=1), worker="reaper-publish-test"
+            acquired = backend.acquire(
+                timeout=datetime.timedelta(seconds=1), worker="requeue-publish-test"
+            )
+            assert acquired is not None
+            failed = dataclasses.replace(
+                acquired,
+                status=TaskResultStatus.FAILED,
+                finished_at=timezone.now(),
             )
             pubsub.subscribe(backend.telemetry_channel)
             self._drain_subscription(pubsub)
-            time.sleep(1.1)
-            RedisBroker(backend).main()
-            message = self._await_message(pubsub, b"egress:default")
+            backend.requeue(failed, timezone.now() + datetime.timedelta(seconds=10))
+            message = self._await_message(pubsub, b"ingress:default")
             assert message["channel"] == backend.telemetry_channel.encode()
         finally:
             pubsub.unsubscribe(backend.telemetry_channel)
