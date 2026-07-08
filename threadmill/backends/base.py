@@ -258,20 +258,16 @@ class ThreadmillTaskBackend(BaseTaskBackend, ABC):
         """
         raise NotImplementedError
 
-    def queue_stats(
+    async def queue_stats(
         self, *, interval: datetime.timedelta = datetime.timedelta(seconds=60)
     ) -> BackendTelemetry:
-        """Return a snapshot of counts for all configured queues.
-
-        Args:
-            interval: The rolling window the caller intends to display.
-        """
+        """Return per-queue task counts for all configured queues."""
         raise NotImplementedError
 
-    def worker_telemetry(
+    async def worker_telemetry(
         self,
     ) -> collections.abc.AsyncIterator[TelemetryEvent]:
-        """Yield structured telemetry events from the backend's pub/sub stream."""
+        """Yield ingress/egress telemetry events from the backend's pub/sub stream."""
         raise NotImplementedError
 
     def dequeue(self, task_result: TaskResult) -> None:

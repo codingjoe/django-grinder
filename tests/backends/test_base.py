@@ -81,10 +81,10 @@ class TestThreadmillTaskBackend:
                 )
             )
 
-    def test_queue_stats__raise_not_implemented_error(self) -> None:
+    async def test_queue_stats__raise_not_implemented_error(self) -> None:
         """Raise NotImplementedError for backend queue_stats API."""
         with pytest.raises(NotImplementedError):
-            BackendDouble(alias="default", params={}).queue_stats()
+            await BackendDouble(alias="default", params={}).queue_stats()
 
     def test_dequeue__raise_not_implemented_error(self) -> None:
         """Raise NotImplementedError for backend dequeue API."""

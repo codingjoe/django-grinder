@@ -45,7 +45,7 @@ class FailingBackend(ThreadmillTaskBackend):
     def peek(self, *args, **kwargs):
         raise RuntimeError("peek failed")
 
-    def queue_stats(self, *, interval=None):
+    async def queue_stats(self, *, interval=None):
         raise RuntimeError("queue_stats failed")
 
 
@@ -250,7 +250,7 @@ class TestInspectorApp:
         app = InspectorApp(backend=default_task_backend, auto_refresh=False)
         async with app.run_test() as pilot:
             await pilot.pause()
-            app.telemetry = app.backend.queue_stats()
+            app.telemetry = await app.backend.queue_stats()
             await pilot.pause()
             queue_list = app.query_one("#queue-list", QueueList)
             assert set(queue_list._items) == set(default_task_backend.queues)
@@ -495,7 +495,7 @@ class TestInspectorApp:
             default_task_backend.acquire(
                 timeout=datetime.timedelta(seconds=1), worker="stale-test"
             )
-            app.telemetry = app.backend.queue_stats()
+            app.telemetry = await app.backend.queue_stats()
             await pilot.pause()
             await pilot.pause()
             assert table.row_count == before

@@ -140,7 +140,7 @@ class TestRedisTaskBackend:
         finally:
             backend.close()
 
-    def test_running_reaper__fails_expired_tasks(self):
+    async def test_running_reaper__fails_expired_tasks(self):
         """Running reaper creates FAILED results for tasks with expired lease."""
         backend = RedisTaskBackend(
             "running_reaper_test",
@@ -175,7 +175,7 @@ class TestRedisTaskBackend:
 
             # Reaping an expired task records a failed result. Live egress
             # now arrives via pub/sub, so backend.queue_stats() rates are zero.
-            stats = backend.queue_stats().queues["default"]
+            stats = (await backend.queue_stats()).queues["default"]
             assert stats.rates.egress == 0
             assert stats.counts.failed == 1
             assert stats.counts.successful == 0
@@ -224,7 +224,7 @@ class TestRedisTaskBackend:
         finally:
             backend.close()
 
-    def test_queue_stats__empty_backend(self):
+    async def test_queue_stats__empty_backend(self):
         """queue_stats returns zero counts for an empty backend."""
         backend = RedisTaskBackend(
             "telemetry_empty_test",
@@ -237,12 +237,12 @@ class TestRedisTaskBackend:
             },
         )
         try:
-            telemetry = backend.queue_stats()
+            telemetry = await backend.queue_stats()
             assert telemetry == BackendTelemetry(queues={"default": _stats()})
         finally:
             backend.close()
 
-    def test_queue_stats__counts_tasks(self):
+    async def test_queue_stats__counts_tasks(self):
         """queue_stats reports per-status counts; rates come from pub/sub, not polling."""
         backend = RedisTaskBackend(
             "telemetry_counts_test",
@@ -282,7 +282,7 @@ class TestRedisTaskBackend:
                 )
             )
 
-            telemetry = backend.queue_stats()
+            telemetry = await backend.queue_stats()
             assert telemetry.queues["default"] == _stats(
                 successful=1,
                 failed=1,
@@ -290,7 +290,7 @@ class TestRedisTaskBackend:
         finally:
             backend.close()
 
-    def test_queue_stats__counts_successful_and_failed(self):
+    async def test_queue_stats__counts_successful_and_failed(self):
         """queue_stats counts successful and finished results; polling rates stay zero."""
         backend = RedisTaskBackend(
             "telemetry_egress_test",
@@ -331,7 +331,7 @@ class TestRedisTaskBackend:
                 )
             )
 
-            stats = backend.queue_stats().queues["default"]
+            stats = (await backend.queue_stats()).queues["default"]
             # Rates come from the pub/sub buffer, not from Redis polling.
             assert stats.rates.ingress == 0
             assert stats.rates.egress == 0
@@ -340,7 +340,7 @@ class TestRedisTaskBackend:
         finally:
             backend.close()
 
-    def test_queue_stats__successful_failed_evicted_by_result_ttl(self):
+    async def test_queue_stats__successful_failed_evicted_by_result_ttl(self):
         """successful/failed segment counts drop when results age out of result_ttl."""
         backend = RedisTaskBackend(
             "telemetry_eviction_test",
@@ -387,7 +387,7 @@ class TestRedisTaskBackend:
 
             assert backend.client.zcard(successful_key) == 1
             assert backend.client.zcard(failed_key) == 1
-            stats = backend.queue_stats().queues["default"]
+            stats = (await backend.queue_stats()).queues["default"]
             assert stats.counts.successful == 1
             assert stats.counts.failed == 1
         finally:

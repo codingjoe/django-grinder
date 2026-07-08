@@ -577,15 +577,9 @@ class InspectorApp(App):
 
     @work(exclusive=True, group="queue-stats")
     async def _poll_queue_stats(self) -> None:
-        """Poll the backend for counts and merge live pub/sub rates.
-
-        Runs as a textual worker so the synchronous ``queue_stats`` call is
-        offloaded via :func:`asyncio.to_thread`, keeping the UI thread free.
-        Called periodically by a :meth:`~textual.app.App.set_interval` timer
-        and immediately after mutating queue actions.
-        """
+        """Fetch queue counts and merge live pub/sub rates into the telemetry."""
         try:
-            telemetry = await asyncio.to_thread(self.backend.queue_stats)
+            telemetry = await self.backend.queue_stats()
         except Exception:  # noqa: BLE001
             logger.exception("Failed to refresh queue stats")
             return
@@ -617,9 +611,11 @@ class InspectorApp(App):
 
     @work(exclusive=True, group="telemetry")
     async def _listen_telemetry(self) -> None:
-        """Subscribe to the backend's pub/sub telemetry stream and feed the buffer."""
+        """Feed the telemetry buffer from the backend's pub/sub stream."""
         try:
             stream = self.backend.worker_telemetry()
+            if asyncio.iscoroutine(stream):
+                stream = await stream
         except NotImplementedError:
             return
         if stream is None:

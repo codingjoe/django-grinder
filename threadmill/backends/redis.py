@@ -415,15 +415,11 @@ class RedisTaskBackend(ThreadmillTaskBackend):
             return self.deserialize_task_result(data)
         raise TaskResultDoesNotExist(f"Task result {result_id!r} does not exist.")
 
-    def queue_stats(
+    async def queue_stats(
         self, *, interval: datetime.timedelta = datetime.timedelta(seconds=60)
     ) -> BackendTelemetry:
-        """Return point-in-time counts for all configured queues.
-
-        Rates are zero here; live throughput arrives via pub/sub on
-        :meth:`worker_telemetry` and is assembled by the inspector.
-        """
-        pipe = self.client.pipeline()
+        client = redis.asyncio.Redis.from_url(self.redis_url)
+        pipe = client.pipeline()
         for queue_name in self.queues:
             pipe.zcard(self._segment_key(TaskResultStatus.READY, queue_name))
             pipe.zcard(self._segment_key(TaskResultStatus.RUNNING, queue_name))
@@ -432,7 +428,8 @@ class RedisTaskBackend(ThreadmillTaskBackend):
             )
             pipe.zcard(self._segment_key(TaskResultStatus.SUCCESSFUL, queue_name))
             pipe.zcard(self._segment_key(TaskResultStatus.FAILED, queue_name))
-        results = pipe.execute()
+        results = await pipe.execute()
+        await client.aclose()
         zero_rates = QueueRates(interval=interval, ingress=0, egress=0)
         queues: dict[str, QueueStats] = {}
         for index, queue_name in enumerate(self.queues):
@@ -449,18 +446,9 @@ class RedisTaskBackend(ThreadmillTaskBackend):
             )
         return BackendTelemetry(queues=queues)
 
-    def worker_telemetry(
+    async def worker_telemetry(
         self,
-    ) -> collections.abc.AsyncIterator[TelemetryEvent] | None:
-        """Subscribe to the backend's telemetry pub/sub channel.
-
-        Yields structured :class:`TelemetryEvent` instances. The connection
-        is opened with the asyncio client so the inspector can consume it off
-        the UI thread.
-        """
-        return self._telemetry_stream()
-
-    async def _telemetry_stream(self) -> collections.abc.AsyncIterator[TelemetryEvent]:
+    ) -> collections.abc.AsyncGenerator[TelemetryEvent]:
         client = redis.asyncio.Redis.from_url(self.redis_url)
         pubsub = client.pubsub()
         await pubsub.subscribe(self.telemetry_channel)
@@ -469,19 +457,14 @@ class RedisTaskBackend(ThreadmillTaskBackend):
             async for message in pubsub.listen():
                 if (data := message.get("data")) is not None:
                     payload = data.decode() if isinstance(data, bytes) else data
-                    yield self._parse_telemetry_payload(payload)
+                    direction, _, queue_name = payload.partition(":")
+                    yield TelemetryEvent(
+                        direction=TelemetryDirection(direction), queue_name=queue_name
+                    )
         finally:
             await pubsub.unsubscribe(self.telemetry_channel)
             await pubsub.aclose()
             await client.aclose()
-
-    @staticmethod
-    def _parse_telemetry_payload(payload: str) -> TelemetryEvent:
-        """Parse a ``"{direction}:{queue_name}"`` pub/sub payload."""
-        direction, _, queue_name = payload.partition(":")
-        return TelemetryEvent(
-            direction=TelemetryDirection(direction), queue_name=queue_name
-        )
 
     def close(self) -> None:
         """Close the Redis connection."""
