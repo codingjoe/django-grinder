@@ -37,6 +37,7 @@ Run a single test by node ID, e.g. `uv run pytest tests/test_command.py::TestCom
   ```bash
   curl -sSL https://raw.githubusercontent.com/codingjoe/naming-things/refs/heads/main/README.md
   ```
+- Use Google-style docstrings for mkdocs. NEVER use RST directives (`:param:`, `:returns:`, `:meth:`).
 - NEVER format code, tests, or docs manually. MUST USE `prek run --all-files`.
 
 ## Coverage

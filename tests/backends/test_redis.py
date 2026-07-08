@@ -61,54 +61,10 @@ class TestRedisBroker:
                 patch.object(
                     broker, "_reap_running_queue", side_effect=RuntimeError("reaper")
                 ),
-                patch.object(
-                    default_task_backend,
-                    "_trim_telemetry",
-                    side_effect=RuntimeError("trim"),
-                ),
             ):
                 broker.main()
         assert "Mover error for queue" in caplog.text
         assert "Running reaper error for queue" in caplog.text
-        assert "Telemetry trim error for queue" in caplog.text
-
-    def test_main__trims_stale_telemetry(self):
-        """main() trims every telemetry series older than result_ttl."""
-        backend = RedisTaskBackend(
-            "broker_trim_test",
-            {
-                "QUEUES": ["default"],
-                "REDIS_URL": "redis://localhost:6379/0",
-                "OPTIONS": {
-                    "result_ttl": datetime.timedelta(seconds=60),
-                },
-            },
-        )
-        try:
-            task_result = backend.enqueue(echo, args=[1])
-            ingress_key = backend.INGRESS_KEY.format(
-                prefix=backend.key_prefix, queue_name="default"
-            )
-            successful_key = backend._segment_key(
-                TaskResultStatus.SUCCESSFUL, "default"
-            )
-            failed_key = backend._segment_key(TaskResultStatus.FAILED, "default")
-            old = (timezone.now() - datetime.timedelta(seconds=120)).timestamp() * 1000
-            backend.client.zadd(ingress_key, {task_result.id: old})
-            backend.client.zadd(successful_key, {task_result.id: old})
-            backend.client.zadd(failed_key, {task_result.id: old})
-            assert backend.client.zcard(ingress_key) == 1
-            assert backend.client.zcard(successful_key) == 1
-            assert backend.client.zcard(failed_key) == 1
-
-            broker = RedisBroker(backend)
-            broker.main()
-
-            assert backend.client.zcard(ingress_key) == 0
-            assert backend.client.zcard(successful_key) == 0
-            assert backend.client.zcard(failed_key) == 0
-        finally:
-            backend.close()
 
 
 class TestRedisTaskBackend:
@@ -184,7 +140,7 @@ class TestRedisTaskBackend:
         finally:
             backend.close()
 
-    def test_running_reaper__fails_expired_tasks(self):
+    async def test_running_reaper__fails_expired_tasks(self):
         """Running reaper creates FAILED results for tasks with expired lease."""
         backend = RedisTaskBackend(
             "running_reaper_test",
@@ -217,9 +173,10 @@ class TestRedisTaskBackend:
             assert len(result.errors) == 1
             assert "AcknowledgementTimeout" in result.errors[0].exception_class_path
 
-            # Reaping an expired task must count as egress and failed
-            stats = backend.telemetry().queues["default"]
-            assert stats.rates.egress == 1
+            # Reaping an expired task records a failed result. Live egress
+            # now arrives via pub/sub, so backend.queue_stats() rates are zero.
+            stats = (await backend.queue_stats()).queues["default"]
+            assert stats.rates.egress == 0
             assert stats.counts.failed == 1
             assert stats.counts.successful == 0
         finally:
@@ -267,8 +224,8 @@ class TestRedisTaskBackend:
         finally:
             backend.close()
 
-    def test_telemetry__empty_backend(self):
-        """Telemetry returns zero counts for an empty backend."""
+    async def test_queue_stats__empty_backend(self):
+        """queue_stats returns zero counts for an empty backend."""
         backend = RedisTaskBackend(
             "telemetry_empty_test",
             {
@@ -280,13 +237,13 @@ class TestRedisTaskBackend:
             },
         )
         try:
-            telemetry = backend.telemetry()
+            telemetry = await backend.queue_stats()
             assert telemetry == BackendTelemetry(queues={"default": _stats()})
         finally:
             backend.close()
 
-    def test_telemetry__counts_tasks(self):
-        """Telemetry reflects windowed ingress/egress rates and per-status counts."""
+    async def test_queue_stats__counts_tasks(self):
+        """queue_stats reports per-status counts; rates come from pub/sub, not polling."""
         backend = RedisTaskBackend(
             "telemetry_counts_test",
             {
@@ -325,18 +282,16 @@ class TestRedisTaskBackend:
                 )
             )
 
-            telemetry = backend.telemetry()
+            telemetry = await backend.queue_stats()
             assert telemetry.queues["default"] == _stats(
-                ingress=2,
-                egress=2,
                 successful=1,
                 failed=1,
             )
         finally:
             backend.close()
 
-    def test_telemetry__egress_equals_successful_plus_failed(self):
-        """Egress is derived as successful + failed over the display window."""
+    async def test_queue_stats__counts_successful_and_failed(self):
+        """queue_stats counts successful and finished results; polling rates stay zero."""
         backend = RedisTaskBackend(
             "telemetry_egress_test",
             {
@@ -376,15 +331,16 @@ class TestRedisTaskBackend:
                 )
             )
 
-            stats = backend.telemetry().queues["default"]
-            assert stats.rates.egress == stats.counts.successful + stats.counts.failed
-            assert stats.rates.egress == 3
+            stats = (await backend.queue_stats()).queues["default"]
+            # Rates come from the pub/sub buffer, not from Redis polling.
+            assert stats.rates.ingress == 0
+            assert stats.rates.egress == 0
             assert stats.counts.successful == 2
             assert stats.counts.failed == 1
         finally:
             backend.close()
 
-    def test_telemetry__successful_failed_evicted_by_result_ttl(self):
+    async def test_queue_stats__successful_failed_evicted_by_result_ttl(self):
         """successful/failed segment counts drop when results age out of result_ttl."""
         backend = RedisTaskBackend(
             "telemetry_eviction_test",
@@ -431,16 +387,37 @@ class TestRedisTaskBackend:
 
             assert backend.client.zcard(successful_key) == 1
             assert backend.client.zcard(failed_key) == 1
-            stats = backend.telemetry().queues["default"]
+            stats = (await backend.queue_stats()).queues["default"]
             assert stats.counts.successful == 1
             assert stats.counts.failed == 1
         finally:
             backend.close()
 
-    def test_telemetry__ingress_egress_age_out_of_window(self):
-        """Ingress and egress older than the display window are excluded from the rates."""
+    @staticmethod
+    def _await_message(pubsub, expected: bytes, *, timeout: float = 2.0):
+        """Drain pubsub until a user message with the expected payload arrives."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            message = pubsub.get_message(timeout=0.1)
+            if message and message.get("type") == "message":
+                if message["data"] == expected:
+                    return message
+        raise AssertionError(f"no pubsub message {expected!r} received")
+
+    @staticmethod
+    def _drain_subscription(pubsub, *, timeout: float = 2.0):
+        """Block until the pubsub connection reports it is subscribed."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if pubsub.get_message(timeout=0.1):
+                if pubsub.subscribed:
+                    return
+        raise AssertionError("pubsub never reached subscribed state")
+
+    def test_enqueue__publishes_ingress_telemetry(self):
+        """enqueue() publishes an ingress event on the telemetry channel."""
         backend = RedisTaskBackend(
-            "telemetry_window_test",
+            "telemetry_publish_ingress_test",
             {
                 "QUEUES": ["default"],
                 "REDIS_URL": "redis://localhost:6379/0",
@@ -449,100 +426,39 @@ class TestRedisTaskBackend:
                 },
             },
         )
+        pubsub = backend.client.pubsub()
         try:
-            task_result = backend.enqueue(echo, args=[42])
-            acquired = backend.acquire(
-                timeout=datetime.timedelta(seconds=1), worker="window-test"
-            )
-            assert acquired is not None
-            backend.acknowledge(
-                dataclasses.replace(
-                    acquired,
-                    status=TaskResultStatus.SUCCESSFUL,
-                    finished_at=timezone.now(),
-                )
-            )
-
-            ingress_key = backend.INGRESS_KEY.format(
-                prefix=backend.key_prefix, queue_name="default"
-            )
-            successful_results_key = backend._segment_key(
-                TaskResultStatus.SUCCESSFUL, "default"
-            )
-            old = (timezone.now() - datetime.timedelta(seconds=120)).timestamp() * 1000
-            backend.client.zadd(ingress_key, {task_result.id: old})
-            backend.client.zadd(successful_results_key, {task_result.id: old})
-
-            stats = backend.telemetry().queues["default"]
-            # Older than the 60s display window: not counted as recent throughput.
-            assert stats.rates.ingress == 0
-            assert stats.rates.egress == 0
-            # Ingress is evicted by the read path (retention = result_ttl = 60s).
-            assert backend.client.zcard(ingress_key) == 0
-            # The results segment is evicted by acknowledge/reaper, not by reads,
-            # so the aged result is still present in the segment count.
-            assert backend.client.zcard(successful_results_key) == 1
-            assert stats.counts.successful == 1
+            pubsub.subscribe(backend.telemetry_channel)
+            self._drain_subscription(pubsub)
+            backend.enqueue(echo, args=[1])
+            message = self._await_message(pubsub, b"ingress:default")
+            assert message["channel"] == backend.telemetry_channel.encode()
         finally:
+            pubsub.unsubscribe(backend.telemetry_channel)
+            pubsub.close()
             backend.close()
 
-    def test_telemetry__interval_shrinks_window(self):
-        """A custom interval excludes events from the rate but never trims below result_ttl."""
+    def test_acknowledge__publishes_egress_telemetry(self):
+        """acknowledge() publishes an egress event on the telemetry channel."""
         backend = RedisTaskBackend(
-            "telemetry_interval_test",
+            "telemetry_publish_egress_test",
             {
                 "QUEUES": ["default"],
                 "REDIS_URL": "redis://localhost:6379/0",
                 "OPTIONS": {
+                    "lease_ttl": datetime.timedelta(hours=1),
                     "result_ttl": datetime.timedelta(seconds=60),
                 },
             },
         )
-        try:
-            task_result = backend.enqueue(echo, args=[42])
-            ingress_key = backend.INGRESS_KEY.format(
-                prefix=backend.key_prefix, queue_name="default"
-            )
-            recent = (timezone.now() - datetime.timedelta(seconds=5)).timestamp() * 1000
-            backend.client.zadd(ingress_key, {task_result.id: recent})
-
-            # The 30s-old event is inside the default 60s window but outside a 10s one.
-            stats = backend.telemetry(interval=datetime.timedelta(seconds=10)).queues[
-                "default"
-            ]
-            assert stats.rates.ingress == 1
-
-            stale = (timezone.now() - datetime.timedelta(seconds=30)).timestamp() * 1000
-            backend.client.zadd(ingress_key, {task_result.id: stale})
-            stats = backend.telemetry(interval=datetime.timedelta(seconds=10)).queues[
-                "default"
-            ]
-            # Outside the 10s count window, so not displayed...
-            assert stats.rates.ingress == 0
-            # ...but still retained for result_ttl (60s): a narrower display
-            # window must not clobber the retention policy.
-            assert backend.client.zcard(ingress_key) == 1
-        finally:
-            backend.close()
-
-    def test_telemetry__egress_window_follows_display_interval(self):
-        """Egress rates are windowed by the display interval, not by result_ttl."""
-        backend = RedisTaskBackend(
-            "telemetry_egress_window_test",
-            {
-                "QUEUES": ["default"],
-                "REDIS_URL": "redis://localhost:6379/0",
-                "OPTIONS": {
-                    "result_ttl": datetime.timedelta(seconds=60),
-                },
-            },
-        )
+        pubsub = backend.client.pubsub()
         try:
             backend.enqueue(echo, args=[1])
             acquired = backend.acquire(
-                timeout=datetime.timedelta(seconds=1), worker="egress-window-test"
+                timeout=datetime.timedelta(seconds=1), worker="publish-test"
             )
-            assert acquired is not None
+            pubsub.subscribe(backend.telemetry_channel)
+            self._drain_subscription(pubsub)
             backend.acknowledge(
                 dataclasses.replace(
                     acquired,
@@ -550,31 +466,46 @@ class TestRedisTaskBackend:
                     finished_at=timezone.now(),
                 )
             )
-            successful_key = backend._segment_key(
-                TaskResultStatus.SUCCESSFUL, "default"
-            )
-
-            # Inside result_ttl (60s) but outside a 10s display window.
-            recent = (
-                timezone.now() - datetime.timedelta(seconds=30)
-            ).timestamp() * 1000
-            backend.client.zadd(successful_key, {acquired.id: recent})
-
-            # A narrow window excludes the 30s-old result from the egress rate...
-            narrow = backend.telemetry(interval=datetime.timedelta(seconds=10)).queues[
-                "default"
-            ]
-            assert narrow.rates.egress == 0
-            # ...but it is still a present segment member (ZCARD is time-independent).
-            assert narrow.counts.successful == 1
-
-            # A wide window (60s) includes the 30s-old result in the egress rate.
-            wide = backend.telemetry(interval=datetime.timedelta(seconds=60)).queues[
-                "default"
-            ]
-            assert wide.rates.egress == 1
-            assert wide.counts.successful == 1
+            message = self._await_message(pubsub, b"egress:default")
+            assert message["channel"] == backend.telemetry_channel.encode()
         finally:
+            pubsub.unsubscribe(backend.telemetry_channel)
+            pubsub.close()
+            backend.close()
+
+    def test_requeue__publishes_ingress_telemetry(self):
+        """requeue() publishes an ingress event for the re-queued task."""
+        backend = RedisTaskBackend(
+            "telemetry_publish_requeue_test",
+            {
+                "QUEUES": ["default"],
+                "REDIS_URL": "redis://localhost:6379/0",
+                "OPTIONS": {
+                    "lease_ttl": datetime.timedelta(hours=1),
+                    "result_ttl": datetime.timedelta(seconds=60),
+                },
+            },
+        )
+        pubsub = backend.client.pubsub()
+        try:
+            backend.enqueue(echo, args=[1])
+            acquired = backend.acquire(
+                timeout=datetime.timedelta(seconds=1), worker="requeue-publish-test"
+            )
+            assert acquired is not None
+            failed = dataclasses.replace(
+                acquired,
+                status=TaskResultStatus.FAILED,
+                finished_at=timezone.now(),
+            )
+            pubsub.subscribe(backend.telemetry_channel)
+            self._drain_subscription(pubsub)
+            backend.requeue(failed, timezone.now() + datetime.timedelta(seconds=10))
+            message = self._await_message(pubsub, b"ingress:default")
+            assert message["channel"] == backend.telemetry_channel.encode()
+        finally:
+            pubsub.unsubscribe(backend.telemetry_channel)
+            pubsub.close()
             backend.close()
 
     def _acknowledge(self, status: TaskResultStatus) -> str:

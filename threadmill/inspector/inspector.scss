@@ -42,6 +42,29 @@ Select {
     width: 42;
 }
 
+#sparkline-row {
+    height: 5;
+    margin-bottom: 0;
+}
+
+#ingress-sparkline,
+#egress-sparkline {
+    width: 1fr;
+    height: 1fr;
+    padding: 0;
+    margin: 0;
+    border: round $accent 40%;
+    border-title-color: $primary;
+}
+
+#ingress-sparkline > .sparkline--max-color {
+    color: $success;
+}
+
+#egress-sparkline > .sparkline--max-color {
+    color: $error;
+}
+
 #backend-row {
     height: 3;
 }
@@ -76,7 +99,7 @@ QueueList ListItem {
 }
 
 TaskList {
-    height: 60%;
+    height: 1fr;
 
     TabbedContent,
     ContentSwitcher,
@@ -104,7 +127,7 @@ DataTable {
 }
 
 TaskDetail {
-    height: 40%;
+    height: 1fr;
     width: 100%;
     overflow: scroll;
     padding: 0 1;

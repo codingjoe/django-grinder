@@ -11,7 +11,9 @@ def _flush_keys(backend) -> None:
 
 @pytest.fixture(autouse=True)
 def flush_default_backend():
-    """Flush all threadmill keys before and after each test."""
+    """Flush all threadmill keys and reset async client before and after each test."""
     _flush_keys(default_task_backend)
+    default_task_backend._async_client = None
     yield
     _flush_keys(default_task_backend)
+    default_task_backend._async_client = None

@@ -1,5 +1,6 @@
 """Redis-backed durable priority queue backend for Django's task framework."""
 
+import collections.abc
 import dataclasses
 import datetime
 import logging
@@ -10,6 +11,7 @@ from collections.abc import Generator, Sequence
 from pathlib import Path
 
 import redis
+import redis.asyncio
 from django.tasks import DEFAULT_TASK_QUEUE_NAME, TaskResult, TaskResultStatus
 from django.tasks.exceptions import TaskResultDoesNotExist
 from django.tasks.signals import task_enqueued
@@ -21,6 +23,8 @@ from threadmill.backends.base import (
     QueueCounts,
     QueueRates,
     QueueStats,
+    TelemetryDirection,
+    TelemetryEvent,
     ThreadmillTaskBackend,
 )
 
@@ -88,7 +92,6 @@ class RedisBroker(Broker):
 
     def main(self) -> None:
         """Run mover and running reaper passes for all queues."""
-        now_ms = time.time() * 1000
         for queue_name in self.backend.queues:
             try:
                 self._move_queue(queue_name)
@@ -99,11 +102,6 @@ class RedisBroker(Broker):
                 self._reap_running_queue(queue_name)
             except Exception:  # noqa: BLE001
                 logger.exception("Running reaper error for queue %r", queue_name)
-
-            try:
-                self.backend._trim_telemetry(queue_name, now_ms=now_ms)
-            except Exception:  # noqa: BLE001
-                logger.exception("Telemetry trim error for queue %r", queue_name)
 
 
 class RedisTaskBackend(ThreadmillTaskBackend):
@@ -126,7 +124,7 @@ class RedisTaskBackend(ThreadmillTaskBackend):
     SEGMENT_KEY = "{prefix}:{queue_name}:{status}"
     DEFERRED_KEY = "{prefix}:{queue_name}:deferred"
 
-    INGRESS_KEY = "{prefix}:{queue_name}:ingress:events"
+    TELEMETRY_CHANNEL = "{prefix}:telemetry"
 
     ACQUIRE_SCRIPT = _load_lua("acquire")
     """Pop the next task from a priority queue and move it directly to the running set."""
@@ -150,12 +148,22 @@ class RedisTaskBackend(ThreadmillTaskBackend):
                 f"REDIS_URL must be specified in your settings for the {type(self).__name__}."
             ) from e
         self.client = redis.from_url(redis_url)
+        self._async_client: redis.asyncio.Redis | None = None
+        self.redis_url = redis_url
         self.key_prefix = f"threadmill:{{{alias}}}"
+        self.telemetry_channel = self.TELEMETRY_CHANNEL.format(prefix=self.key_prefix)
         self.lease_ttl = self.options.get("lease_ttl", datetime.timedelta(hours=1))
         self.result_ttl = self.options.get("result_ttl", datetime.timedelta(days=1))
         self.batch_size = self.options.get("batch_size", 100)
         self._acquire_script = self.client.register_script(self.ACQUIRE_SCRIPT)
         self._acknowledge_script = self.client.register_script(self.ACKNOWLEDGE_SCRIPT)
+
+    @property
+    def async_client(self) -> redis.asyncio.Redis:
+        """Lazily-created async Redis client, reused across calls."""
+        if self._async_client is None:
+            self._async_client = redis.asyncio.Redis.from_url(self.redis_url)
+        return self._async_client
 
     def _compute_score(self, priority: int, enqueued_at: datetime.datetime) -> float:
         """Compute a ZSET score for priority-ordered FIFO queueing.
@@ -196,14 +204,10 @@ class RedisTaskBackend(ThreadmillTaskBackend):
         )
 
         score = self._compute_score(task.priority, enqueued_at)
-        enqueued_at_ms = enqueued_at.timestamp() * 1000
         serialized = self.serialize_task_result(task_result)
         task_key = self.TASK_KEY.format(prefix=self.key_prefix, task_id=task_result.id)
         task_data_ttl = int(
             self.lease_ttl.total_seconds() * 3 + self.result_ttl.total_seconds()
-        )
-        ingress_key = self.INGRESS_KEY.format(
-            prefix=self.key_prefix, queue_name=task.queue_name
         )
 
         pipe = self.client.pipeline()
@@ -216,7 +220,7 @@ class RedisTaskBackend(ThreadmillTaskBackend):
             },
         )
         pipe.expire(task_key, task_data_ttl)
-        pipe.zadd(ingress_key, {task_result.id: enqueued_at_ms})
+        pipe.publish(self.telemetry_channel, f"ingress:{task.queue_name}")
 
         if task.run_after is not None:
             deferred_key = self.DEFERRED_KEY.format(
@@ -310,6 +314,8 @@ class RedisTaskBackend(ThreadmillTaskBackend):
                 str(int(self.result_ttl.total_seconds())),
                 str(finish_score),
                 task_result.status.name,
+                self.telemetry_channel,
+                task_result.task.queue_name,
             ],
         )
 
@@ -347,6 +353,7 @@ class RedisTaskBackend(ThreadmillTaskBackend):
         pipe.hset(task_key, mapping={"data": serialized, "score": str(score)})
         pipe.expire(task_key, task_data_ttl)
         pipe.zadd(deferred_key, {task_result.id: run_after_ms})
+        pipe.publish(self.telemetry_channel, f"ingress:{task_result.task.queue_name}")
         pipe.execute()
 
     def dequeue(self, task_result: TaskResult) -> None:
@@ -416,84 +423,61 @@ class RedisTaskBackend(ThreadmillTaskBackend):
             return self.deserialize_task_result(data)
         raise TaskResultDoesNotExist(f"Task result {result_id!r} does not exist.")
 
-    def _trim_telemetry(self, queue_name: str, *, now_ms: float) -> None:
-        cutoff = now_ms - self.result_ttl.total_seconds() * 1000
-        pipe = self.client.pipeline()
-        pipe.zremrangebyscore(
-            self.INGRESS_KEY.format(prefix=self.key_prefix, queue_name=queue_name),
-            0,
-            cutoff,
-        )
-        pipe.zremrangebyscore(
-            self._segment_key(TaskResultStatus.SUCCESSFUL, queue_name),
-            0,
-            cutoff,
-        )
-        pipe.zremrangebyscore(
-            self._segment_key(TaskResultStatus.FAILED, queue_name),
-            0,
-            cutoff,
-        )
-        pipe.execute()
-
-    def telemetry(
+    async def queue_stats(
         self, *, interval: datetime.timedelta = datetime.timedelta(seconds=60)
     ) -> BackendTelemetry:
-        now_ms = time.time() * 1000
-        window_start_ms = now_ms - interval.total_seconds() * 1000
-        exclusive_start = f"({window_start_ms}"
-        retention_start_ms = now_ms - self.result_ttl.total_seconds() * 1000
-        pipe = self.client.pipeline()
+        client = self.async_client
+        pipe = client.pipeline()
         for queue_name in self.queues:
             pipe.zcard(self._segment_key(TaskResultStatus.READY, queue_name))
             pipe.zcard(self._segment_key(TaskResultStatus.RUNNING, queue_name))
             pipe.zcard(
                 self.DEFERRED_KEY.format(prefix=self.key_prefix, queue_name=queue_name)
             )
-            successful_results_key = self._segment_key(
-                TaskResultStatus.SUCCESSFUL, queue_name
-            )
-            failed_results_key = self._segment_key(TaskResultStatus.FAILED, queue_name)
-            pipe.zcard(successful_results_key)
-            pipe.zcard(failed_results_key)
-            ingress_key = self.INGRESS_KEY.format(
-                prefix=self.key_prefix, queue_name=queue_name
-            )
-            pipe.zcount(ingress_key, exclusive_start, now_ms)
-            pipe.zcount(successful_results_key, exclusive_start, now_ms)
-            pipe.zcount(failed_results_key, exclusive_start, now_ms)
-            pipe.zremrangebyscore(ingress_key, 0, retention_start_ms)
-        results = pipe.execute()
+            pipe.zcard(self._segment_key(TaskResultStatus.SUCCESSFUL, queue_name))
+            pipe.zcard(self._segment_key(TaskResultStatus.FAILED, queue_name))
+        results = await pipe.execute()
+        zero_rates = QueueRates(interval=interval, ingress=0, egress=0)
         queues: dict[str, QueueStats] = {}
         for index, queue_name in enumerate(self.queues):
-            base = index * 9
-            (
-                ready,
-                running,
-                deferred,
-                successful,
-                failed,
-                ingress,
-                successful_rate,
-                failed_rate,
-                _,
-            ) = (int(c or 0) for c in results[base : base + 9])
+            base = index * 5
             queues[queue_name] = QueueStats(
                 counts=QueueCounts(
-                    ready=ready,
-                    running=running,
-                    deferred=deferred,
-                    successful=successful,
-                    failed=failed,
+                    ready=int(results[base] or 0),
+                    running=int(results[base + 1] or 0),
+                    deferred=int(results[base + 2] or 0),
+                    successful=int(results[base + 3] or 0),
+                    failed=int(results[base + 4] or 0),
                 ),
-                rates=QueueRates(
-                    interval=interval,
-                    ingress=ingress,
-                    egress=successful_rate + failed_rate,
-                ),
+                rates=zero_rates,
             )
         return BackendTelemetry(queues=queues)
 
+    async def worker_telemetry(
+        self,
+    ) -> collections.abc.AsyncGenerator[TelemetryEvent]:
+        client = self.async_client
+        pubsub = client.pubsub()
+        await pubsub.subscribe(self.telemetry_channel)
+        pubsub.ignore_subscribe_messages = True
+        try:
+            async for message in pubsub.listen():
+                if (data := message.get("data")) is not None:
+                    payload = data.decode() if isinstance(data, bytes) else data
+                    direction, _, queue_name = payload.partition(":")
+                    try:
+                        event = TelemetryEvent(
+                            direction=TelemetryDirection(direction),
+                            queue_name=queue_name,
+                        )
+                    except ValueError:
+                        continue
+                    yield event
+        finally:
+            await pubsub.unsubscribe(self.telemetry_channel)
+            await pubsub.aclose()
+
     def close(self) -> None:
-        """Close the Redis connection."""
+        """Close the Redis connections."""
         self.client.close()
+        self._async_client = None
