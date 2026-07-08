@@ -421,7 +421,7 @@ class RedisTaskBackend(ThreadmillTaskBackend):
         """Return point-in-time counts for all configured queues.
 
         Rates are zero here; live throughput arrives via pub/sub on
-        :meth:`subscribe_telemetry_events` and is assembled by the inspector.
+        :meth:`worker_telemetry` and is assembled by the inspector.
         """
         pipe = self.client.pipeline()
         for queue_name in self.queues:
@@ -464,10 +464,9 @@ class RedisTaskBackend(ThreadmillTaskBackend):
         client = redis.asyncio.Redis.from_url(self.redis_url)
         pubsub = client.pubsub()
         await pubsub.subscribe(self.telemetry_channel)
+        pubsub.ignore_subscribe_messages = True
         try:
-            while message := await pubsub.get_message(
-                ignore_subscribe_messages=True, timeout=None
-            ):
+            async for message in pubsub.listen():
                 if (data := message.get("data")) is not None:
                     payload = data.decode() if isinstance(data, bytes) else data
                     yield self._parse_telemetry_payload(payload)

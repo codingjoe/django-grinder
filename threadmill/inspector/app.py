@@ -473,6 +473,7 @@ class InspectorApp(App):
         self._task_detail: TaskDetail | None = None
         self._options_static: Static | None = None
         self._sparkline_timer = None
+        self._telemetry_timer = None
         self._auto_refresh = auto_refresh
         self.telemetry_buffer = TelemetryBuffer()
         self.set_reactive(InspectorApp.backend, backend)
@@ -496,14 +497,8 @@ class InspectorApp(App):
                     )
                 with Vertical(id="right-pane"):
                     with Horizontal(id="sparkline-row"):
-                        yield Sparkline(
-                            id="ingress-sparkline",
-                            max_color="ansi_green",
-                        )
-                        yield Sparkline(
-                            id="egress-sparkline",
-                            max_color="ansi_red",
-                        )
+                        yield Sparkline(id="ingress-sparkline")
+                        yield Sparkline(id="egress-sparkline")
                     yield TaskList(id="task-list").data_bind(
                         backend=InspectorApp.backend,
                         telemetry=InspectorApp.telemetry,
@@ -519,9 +514,16 @@ class InspectorApp(App):
         self._task_detail = self.query_one("#task-detail", TaskDetail)
         self._options_static = self.query_one("#backend-options", Static)
         self._refresh_options()
+        self.query_one("#ingress-sparkline", Sparkline).border_title = "Ingress"
+        self.query_one("#egress-sparkline", Sparkline).border_title = "Egress"
         self._poll_queue_stats()
         self._listen_telemetry()
         if self._auto_refresh:
+            self._telemetry_timer = self.set_interval(
+                TELEMETRY_INTERVAL.total_seconds(),
+                self._poll_queue_stats,
+                name="telemetry-refresh",
+            )
             self._sparkline_timer = self.set_interval(
                 SPARKLINE_INTERVAL.total_seconds(),
                 self._refresh_sparklines,
@@ -579,24 +581,20 @@ class InspectorApp(App):
 
         Runs as a textual worker so the synchronous ``queue_stats`` call is
         offloaded via :func:`asyncio.to_thread`, keeping the UI thread free.
-        The worker loops until cancelled, sleeping ``TELEMETRY_INTERVAL``
-        between refreshes.
+        Called periodically by a :meth:`~textual.app.App.set_interval` timer
+        and immediately after mutating queue actions.
         """
-        while True:
-            try:
-                telemetry = await asyncio.to_thread(self.backend.queue_stats)
-            except Exception:  # noqa: BLE001
-                logger.exception("Failed to refresh queue stats")
-            else:
-                queue_name = self._task_list.queue_name
-                if queue_name and queue_name in telemetry.queues:
-                    live_rates = self.telemetry_buffer.rates_for(queue_name)
-                    stats = telemetry.queues[queue_name]
-                    telemetry.queues[queue_name] = dataclasses.replace(
-                        stats, rates=live_rates
-                    )
-                self.telemetry = telemetry
-            await asyncio.sleep(TELEMETRY_INTERVAL.total_seconds())
+        try:
+            telemetry = await asyncio.to_thread(self.backend.queue_stats)
+        except Exception:  # noqa: BLE001
+            logger.exception("Failed to refresh queue stats")
+            return
+        queue_name = self._task_list.queue_name
+        if queue_name and queue_name in telemetry.queues:
+            live_rates = self.telemetry_buffer.rates_for(queue_name)
+            stats = telemetry.queues[queue_name]
+            telemetry.queues[queue_name] = dataclasses.replace(stats, rates=live_rates)
+        self.telemetry = telemetry
 
     def _refresh_sparklines(self) -> None:
         """Push the latest 60-second rolling series into the ingress/egress sparklines."""
@@ -620,7 +618,10 @@ class InspectorApp(App):
     @work(exclusive=True, group="telemetry")
     async def _listen_telemetry(self) -> None:
         """Subscribe to the backend's pub/sub telemetry stream and feed the buffer."""
-        stream = self.backend.worker_telemetry()
+        try:
+            stream = self.backend.worker_telemetry()
+        except NotImplementedError:
+            return
         if stream is None:
             return
         try:

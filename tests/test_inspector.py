@@ -245,7 +245,7 @@ class TestInspectorApp:
             task_list = app.query_one("#task-list", TaskList)
             assert task_list.queue_name == item.queue_name
 
-    async def test_telemetry_refresh_updates_and_prunes_queues(self):
+    async def test_queue_stats_refresh_updates_and_prunes_queues(self):
         """Telemetry refresh updates existing queue labels and drops stale queues."""
         app = InspectorApp(backend=default_task_backend, auto_refresh=False)
         async with app.run_test() as pilot:
@@ -258,7 +258,7 @@ class TestInspectorApp:
             await pilot.pause()
             assert list(queue_list._items) == ["default"]
 
-    async def test_telemetry_counts_are_scoped_to_selected_queue(self):
+    async def test_queue_stats_counts_are_scoped_to_selected_queue(self):
         """Tab counts reflect the selected queue, not backend-wide totals."""
         default_task_backend.enqueue(echo, args=[1])
         stats = _stats(ready=1)
@@ -478,7 +478,7 @@ class TestInspectorApp:
             assert app.focused is not None
             assert app.focused.id == "queue-list"
 
-    async def test_telemetry_refresh_does_not_re_peek_task_list(self):
+    async def test_queue_stats_refresh_does_not_re_peek_task_list(self):
         """A telemetry refresh updates counts but leaves task rows stale until manual refresh."""
         default_task_backend.enqueue(echo, args=[1])
         default_task_backend.enqueue(echo, args=[2])

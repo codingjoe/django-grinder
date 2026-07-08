@@ -224,8 +224,8 @@ class TestRedisTaskBackend:
         finally:
             backend.close()
 
-    def test_telemetry__empty_backend(self):
-        """Telemetry returns zero counts for an empty backend."""
+    def test_queue_stats__empty_backend(self):
+        """queue_stats returns zero counts for an empty backend."""
         backend = RedisTaskBackend(
             "telemetry_empty_test",
             {
@@ -242,8 +242,8 @@ class TestRedisTaskBackend:
         finally:
             backend.close()
 
-    def test_telemetry__counts_tasks(self):
-        """Telemetry reports per-status counts; rates come from pub/sub, not polling."""
+    def test_queue_stats__counts_tasks(self):
+        """queue_stats reports per-status counts; rates come from pub/sub, not polling."""
         backend = RedisTaskBackend(
             "telemetry_counts_test",
             {
@@ -290,8 +290,8 @@ class TestRedisTaskBackend:
         finally:
             backend.close()
 
-    def test_telemetry__counts_successful_and_failed(self):
-        """Telemetry counts successful and finished results; polling rates stay zero."""
+    def test_queue_stats__counts_successful_and_failed(self):
+        """queue_stats counts successful and finished results; polling rates stay zero."""
         backend = RedisTaskBackend(
             "telemetry_egress_test",
             {
@@ -340,7 +340,7 @@ class TestRedisTaskBackend:
         finally:
             backend.close()
 
-    def test_telemetry__successful_failed_evicted_by_result_ttl(self):
+    def test_queue_stats__successful_failed_evicted_by_result_ttl(self):
         """successful/failed segment counts drop when results age out of result_ttl."""
         backend = RedisTaskBackend(
             "telemetry_eviction_test",
