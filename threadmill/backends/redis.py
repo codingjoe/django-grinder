@@ -148,6 +148,7 @@ class RedisTaskBackend(ThreadmillTaskBackend):
                 f"REDIS_URL must be specified in your settings for the {type(self).__name__}."
             ) from e
         self.client = redis.from_url(redis_url)
+        self._async_client: redis.asyncio.Redis | None = None
         self.redis_url = redis_url
         self.key_prefix = f"threadmill:{{{alias}}}"
         self.telemetry_channel = self.TELEMETRY_CHANNEL.format(prefix=self.key_prefix)
@@ -156,6 +157,13 @@ class RedisTaskBackend(ThreadmillTaskBackend):
         self.batch_size = self.options.get("batch_size", 100)
         self._acquire_script = self.client.register_script(self.ACQUIRE_SCRIPT)
         self._acknowledge_script = self.client.register_script(self.ACKNOWLEDGE_SCRIPT)
+
+    @property
+    def async_client(self) -> redis.asyncio.Redis:
+        """Lazily-created async Redis client, reused across calls."""
+        if self._async_client is None:
+            self._async_client = redis.asyncio.Redis.from_url(self.redis_url)
+        return self._async_client
 
     def _compute_score(self, priority: int, enqueued_at: datetime.datetime) -> float:
         """Compute a ZSET score for priority-ordered FIFO queueing.
@@ -418,7 +426,7 @@ class RedisTaskBackend(ThreadmillTaskBackend):
     async def queue_stats(
         self, *, interval: datetime.timedelta = datetime.timedelta(seconds=60)
     ) -> BackendTelemetry:
-        client = redis.asyncio.Redis.from_url(self.redis_url)
+        client = self.async_client
         pipe = client.pipeline()
         for queue_name in self.queues:
             pipe.zcard(self._segment_key(TaskResultStatus.READY, queue_name))
@@ -429,7 +437,6 @@ class RedisTaskBackend(ThreadmillTaskBackend):
             pipe.zcard(self._segment_key(TaskResultStatus.SUCCESSFUL, queue_name))
             pipe.zcard(self._segment_key(TaskResultStatus.FAILED, queue_name))
         results = await pipe.execute()
-        await client.aclose()
         zero_rates = QueueRates(interval=interval, ingress=0, egress=0)
         queues: dict[str, QueueStats] = {}
         for index, queue_name in enumerate(self.queues):
@@ -449,7 +456,7 @@ class RedisTaskBackend(ThreadmillTaskBackend):
     async def worker_telemetry(
         self,
     ) -> collections.abc.AsyncGenerator[TelemetryEvent]:
-        client = redis.asyncio.Redis.from_url(self.redis_url)
+        client = self.async_client
         pubsub = client.pubsub()
         await pubsub.subscribe(self.telemetry_channel)
         pubsub.ignore_subscribe_messages = True
@@ -458,14 +465,19 @@ class RedisTaskBackend(ThreadmillTaskBackend):
                 if (data := message.get("data")) is not None:
                     payload = data.decode() if isinstance(data, bytes) else data
                     direction, _, queue_name = payload.partition(":")
-                    yield TelemetryEvent(
-                        direction=TelemetryDirection(direction), queue_name=queue_name
-                    )
+                    try:
+                        event = TelemetryEvent(
+                            direction=TelemetryDirection(direction),
+                            queue_name=queue_name,
+                        )
+                    except ValueError:
+                        continue
+                    yield event
         finally:
             await pubsub.unsubscribe(self.telemetry_channel)
             await pubsub.aclose()
-            await client.aclose()
 
     def close(self) -> None:
-        """Close the Redis connection."""
+        """Close the Redis connections."""
         self.client.close()
+        self._async_client = None

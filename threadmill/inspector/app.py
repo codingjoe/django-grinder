@@ -543,6 +543,7 @@ class InspectorApp(App):
 
     def watch_backend(self) -> None:
         self._refresh_options()
+        self.telemetry_buffer = TelemetryBuffer()
         self._poll_queue_stats()
         self._listen_telemetry()
 
@@ -579,10 +580,8 @@ class InspectorApp(App):
         except Exception:  # noqa: BLE001
             logger.exception("Failed to refresh queue stats")
         else:
-            queue_name = self._task_list.queue_name
-            if queue_name and queue_name in telemetry.queues:
+            for queue_name, stats in telemetry.queues.items():
                 live_rates = self.telemetry_buffer.rates_for(queue_name)
-                stats = telemetry.queues[queue_name]
                 telemetry.queues[queue_name] = dataclasses.replace(
                     stats, rates=live_rates
                 )

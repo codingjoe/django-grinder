@@ -59,7 +59,9 @@ class TelemetryBuffer:
         egress = self._sum_direction(
             queue_name, TelemetryDirection.EGRESS, second, span
         )
-        return QueueRates(interval=interval, ingress=ingress, egress=egress)
+        return QueueRates(
+            interval=datetime.timedelta(seconds=span), ingress=ingress, egress=egress
+        )
 
     def _sum_direction(
         self, queue_name: str, direction: TelemetryDirection, second: int, span: int
