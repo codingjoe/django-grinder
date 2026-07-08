@@ -1,6 +1,7 @@
 -- Fail tasks whose processing lease has expired. Reaped tasks are recorded
 -- in the failed results history (the time series the inspector counts over),
--- then evicted once older than result_ttl.
+-- then evicted once older than result_ttl. A pub/sub event is published per
+-- reaped task so the inspector can track live egress throughput.
 --
 -- KEYS[1]  -- running set (ZSET)
 -- KEYS[2]  -- failed results history (ZSET, scored by finish time)
@@ -10,6 +11,8 @@
 -- ARGV[4]  -- batch size
 -- ARGV[5]  -- result TTL in seconds
 -- ARGV[6]  -- finished_at as ISO format string
+-- ARGV[7]  -- telemetry pub/sub channel
+-- ARGV[8]  -- queue name
 -- Returns: number of tasks failed
 
 local stale = redis.call('ZRANGEBYSCORE', KEYS[1], 0, ARGV[1], 'LIMIT', 0, tonumber(ARGV[4]))
@@ -32,6 +35,7 @@ for _, task_id in ipairs(stale) do
       redis.call('SET', ARGV[3] .. task_id, failed_data, 'EX', ARGV[5])
       redis.call('DEL', ARGV[2] .. task_id)
       redis.call('ZADD', KEYS[2], tonumber(ARGV[1]), task_id)
+      redis.call('PUBLISH', ARGV[7], 'egress:' .. ARGV[8])
     end
   end
 end

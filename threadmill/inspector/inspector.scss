@@ -42,6 +42,19 @@ Select {
     width: 42;
 }
 
+#sparkline-row {
+    height: 2;
+    margin-bottom: 0;
+}
+
+#ingress-sparkline,
+#egress-sparkline {
+    width: 1fr;
+    height: 1;
+    padding: 0;
+    margin: 0;
+}
+
 #backend-row {
     height: 3;
 }

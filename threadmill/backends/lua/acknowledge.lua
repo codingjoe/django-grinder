@@ -3,7 +3,8 @@
 -- per-status results history set. Evicts results whose finish score falls
 -- outside the retention window (result_ttl). The per-status history sets are
 -- the time series the inspector counts over for telemetry, so no separate
--- egress window or status counters are needed here.
+-- egress window or status counters are needed here. A pub/sub event is
+-- published so the inspector can track live egress throughput.
 --
 -- KEYS[1]  -- running set (ZSET)
 -- KEYS[2]  -- result key (STRING, stores serialized TaskResult)
@@ -15,6 +16,8 @@
 -- ARGV[3]  -- result TTL in seconds
 -- ARGV[4]  -- finish timestamp in milliseconds (score for the history set)
 -- ARGV[5]  -- status (SUCCESSFUL or FAILED)
+-- ARGV[6]  -- telemetry pub/sub channel
+-- ARGV[7]  -- queue name
 -- Returns: 1 on success, 0 if task was not in the running set
 
 local removed = redis.call('ZREM', KEYS[1], ARGV[1])
@@ -31,4 +34,5 @@ if ARGV[5] ~= 'SUCCESSFUL' then
 end
 redis.call('ZADD', results_key, finish, ARGV[1])
 redis.call('ZREMRANGEBYSCORE', results_key, 0, cutoff)
+redis.call('PUBLISH', ARGV[6], 'egress:' .. ARGV[7])
 return 1

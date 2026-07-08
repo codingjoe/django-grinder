@@ -245,12 +245,25 @@ class ThreadmillTaskBackend(BaseTaskBackend, ABC):
     def telemetry(
         self, *, interval: datetime.timedelta = datetime.timedelta(seconds=60)
     ) -> BackendTelemetry:
-        """Return a snapshot of stats for all configured queues.
+        """Return a snapshot of counts for all configured queues.
+
+        Rates are no longer populated by polling; live throughput arrives via
+        :meth:`subscribe_telemetry` for backends that support it.
 
         Args:
-            interval: The time window for rolling rates.
+            interval: The rolling window the caller intends to display.
         """
         raise NotImplementedError
+
+    def subscribe_telemetry(self) -> collections.abc.AsyncIterator[str] | None:
+        """Yield telemetry events as ``"{direction}:{queue_name}"`` strings.
+
+        Backends without pub/sub support return ``None`` so the inspector can
+        fall back to counts-only telemetry. The returned async iterator is
+        consumed on the inspector's worker thread and must clean up its
+        subscription on close.
+        """
+        return None
 
     def dequeue(self, task_result: TaskResult) -> None:
         """Delete a single task from its current status segment."""

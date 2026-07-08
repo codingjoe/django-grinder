@@ -1,8 +1,11 @@
 """Textual app for the inspector TUI."""
 
+import asyncio
+import dataclasses
 import datetime
 import logging
 import math
+import time
 import typing
 from typing import Any
 
@@ -13,6 +16,7 @@ from django.tasks import (
     TaskResultStatus,
     task_backends,
 )
+from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
@@ -24,6 +28,7 @@ from textual.widgets import (
     ListItem,
     ListView,
     Select,
+    Sparkline,
     Static,
     TabbedContent,
     TabPane,
@@ -31,11 +36,15 @@ from textual.widgets import (
 
 from ..backends.base import BackendTelemetry, ThreadmillTaskBackend
 from .screens import ConfirmScreen, PurgeScreen
+from .telemetry import TelemetryBuffer
 
 logger = logging.getLogger(__name__)
 
 TELEMETRY_INTERVAL_SECONDS = 2.0
 """Seconds between automatic queue-stat refreshes; the task list stays manual."""
+
+SPARKLINE_INTERVAL_SECONDS = 1.0
+"""Seconds between sparkline refreshes from the rolling telemetry buffer."""
 
 TAB_STATUSES: list[tuple[str, TaskResultStatus | None]] = [
     ("Running", TaskResultStatus.RUNNING),
@@ -460,7 +469,9 @@ class InspectorApp(App):
         self._task_detail: TaskDetail | None = None
         self._options_static: Static | None = None
         self._telemetry_timer = None
+        self._sparkline_timer = None
         self._auto_refresh = auto_refresh
+        self.telemetry_buffer = TelemetryBuffer()
         self.set_reactive(InspectorApp.backend, backend)
 
     def compose(self) -> ComposeResult:
@@ -481,6 +492,15 @@ class InspectorApp(App):
                         telemetry=InspectorApp.telemetry
                     )
                 with Vertical(id="right-pane"):
+                    with Horizontal(id="sparkline-row"):
+                        yield Sparkline(
+                            id="ingress-sparkline",
+                            max_color="ansi_green",
+                        )
+                        yield Sparkline(
+                            id="egress-sparkline",
+                            max_color="ansi_red",
+                        )
                     yield TaskList(id="task-list").data_bind(
                         backend=InspectorApp.backend,
                         telemetry=InspectorApp.telemetry,
@@ -497,11 +517,17 @@ class InspectorApp(App):
         self._options_static = self.query_one("#backend-options", Static)
         self._refresh_options()
         self._refresh_telemetry()
+        self._listen_telemetry()
         if self._auto_refresh:
             self._telemetry_timer = self.set_interval(
                 TELEMETRY_INTERVAL_SECONDS,
                 self._refresh_telemetry,
                 name="telemetry-refresh",
+            )
+            self._sparkline_timer = self.set_interval(
+                SPARKLINE_INTERVAL_SECONDS,
+                self._refresh_sparklines,
+                name="sparkline-refresh",
             )
         self._queue_list.focus()
 
@@ -522,6 +548,7 @@ class InspectorApp(App):
     def watch_backend(self) -> None:
         self._refresh_options()
         self._refresh_telemetry()
+        self._listen_telemetry()
 
     def on_select_changed(self, event: Select.Changed) -> None:
         """Switch backend when the user selects a different alias."""
@@ -549,8 +576,44 @@ class InspectorApp(App):
         self._options_static.update(" ".join(parts) or "No options")
 
     def _refresh_telemetry(self) -> None:
-        """Poll the backend for fresh telemetry."""
+        """Poll the backend for counts and merge live pub/sub rates for the selected queue."""
         try:
-            self.telemetry = self.backend.telemetry()
+            telemetry = self.backend.telemetry()
         except Exception:  # noqa: BLE001
             logger.exception("Failed to refresh telemetry")
+            return
+        queue_name = self._task_list.queue_name
+        if queue_name and queue_name in telemetry.queues:
+            live_rates = self.telemetry_buffer.rates_for(queue_name)
+            stats = telemetry.queues[queue_name]
+            telemetry.queues[queue_name] = dataclasses.replace(stats, rates=live_rates)
+        self.telemetry = telemetry
+
+    def _refresh_sparklines(self) -> None:
+        """Push the latest 60-second rolling series into the ingress/egress sparklines."""
+        queue_name = self._task_list.queue_name
+        ingress = self.query_one("#ingress-sparkline", Sparkline)
+        egress = self.query_one("#egress-sparkline", Sparkline)
+        now = time.monotonic()
+        ingress.data = (
+            self.telemetry_buffer.series(queue_name, "ingress", now=now)
+            if queue_name
+            else [0.0] * 60
+        )
+        egress.data = (
+            self.telemetry_buffer.series(queue_name, "egress", now=now)
+            if queue_name
+            else [0.0] * 60
+        )
+
+    @work(exclusive=True, group="telemetry")
+    async def _listen_telemetry(self) -> None:
+        """Subscribe to the backend's pub/sub telemetry stream and feed the buffer."""
+        stream = self.backend.subscribe_telemetry()
+        if stream is None:
+            return
+        try:
+            async for payload in stream:
+                self.telemetry_buffer.record(payload, now=time.monotonic())
+        except asyncio.CancelledError:
+            raise
