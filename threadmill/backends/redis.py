@@ -190,7 +190,7 @@ class RedisTaskBackend(ThreadmillTaskBackend):
         enqueued_at = timezone.now()
         task_result = TaskResult(
             task=task,
-            id=str(uuid.uuid4()),
+            id=str(uuid.uuid7()),
             status=TaskResultStatus.READY,
             enqueued_at=enqueued_at,
             started_at=None,
