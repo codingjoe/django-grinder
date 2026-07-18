@@ -12,7 +12,7 @@ def _context(*, attempt: int, exception_class: type[Exception]) -> TaskContext:
     """Build a TaskContext with a single error of the given exception class."""
     result = TaskResult(
         task=print,
-        id=str(uuid.uuid4()),
+        id=str(uuid.uuid7()),
         status=TaskResultStatus.FAILED,
         enqueued_at=timezone.now(),
         started_at=timezone.now(),
@@ -132,7 +132,7 @@ class TestExponentialBackoff:
         task = RetryTask(func=echo.func, retry=backoff)
         result = TaskResult(
             task=task,
-            id=str(uuid.uuid4()),
+            id=str(uuid.uuid7()),
             status=TaskResultStatus.FAILED,
             enqueued_at=timezone.now(),
             started_at=timezone.now(),
