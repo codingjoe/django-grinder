@@ -24,7 +24,7 @@ jobs:
         python-version:
           - "3.14"
         django-version:
-          - "6.1a1"
+          - "6.1"
     runs-on: ${{ matrix.os }}
     services:
       redis:
@@ -39,7 +39,7 @@ jobs:
       - uses: astral-sh/setup-uv@v7
         with:
           python-version: ${{ matrix.python-version }}
-      - run: uv run --with django~=${{ matrix.django-version }} pytest -m "not benchmark"
+      - run: uv run --with django~=${{ matrix.django-version }}.0 pytest -m "not benchmark"
       - uses: codecov/codecov-action@v7
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
@@ -50,7 +50,7 @@ jobs:
         os:
           - "ubuntu-latest"
         django-version:
-          - "6.1a1"
+          - "6.1"
         extra:
           - "inspector"
     runs-on: ${{ matrix.os }}
@@ -67,7 +67,7 @@ jobs:
       - uses: astral-sh/setup-uv@v7
         with:
           python-version: ${{ matrix.python-version }}
-      - run: uv run --extra ${{ matrix.extra }} --with django~=${{ matrix.django-version }} pytest -m "not benchmark"
+      - run: uv run --extra ${{ matrix.extra }} --with django~=${{ matrix.django-version }}.0 pytest -m "not benchmark"
       - uses: codecov/codecov-action@v7
         with:
           token: ${{ secrets.CODECOV_TOKEN }}

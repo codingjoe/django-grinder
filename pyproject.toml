@@ -29,7 +29,7 @@ classifiers = [
   "Topic :: Text Processing :: Markup :: Markdown",
 ]
 dynamic = [ "description", "version" ]
-dependencies = [ "django>=6" ]
+dependencies = [ "django>=6.1" ]
 optional-dependencies.inspector = [
   "textual>=8.2.7",
 ]
@@ -84,7 +84,7 @@ lint.isort.split-on-trailing-comma = true
 lint.pydocstyle.convention = "pep257"
 
 [tool.pytest]
-ini_options.minversion = "6.1a1"
+ini_options.minversion = "6.1"
 ini_options.testpaths = [ "tests" ]
 ini_options.addopts = """\
   --cov --cov-report=xml --cov-report=term --tb=short -rxs --benchmark-autosave --benchmark-group-by=fullname \
