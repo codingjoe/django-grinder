@@ -45,6 +45,10 @@ repos:
     rev: v0.21.0
     hooks:
       - id: yamlfmt
+  - repo: https://github.com/tox-dev/pyproject-fmt
+    rev: v2.27.0
+    hooks:
+      - id: pyproject-fmt
 # See https://pre-commit.ci/
 ci:
   autoupdate_schedule: weekly
