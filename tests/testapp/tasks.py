@@ -22,6 +22,12 @@ def boom():
     raise ValueError("boom")
 
 
+@task()
+def count_users():
+    """Count all users in the database (tests model access in workers)."""
+    from django.contrib.auth.models import User  # noqa
+
+
 @task(queue_name="compute")
 def compute_workload():
     """Calculate the first 1000 prime numbers."""

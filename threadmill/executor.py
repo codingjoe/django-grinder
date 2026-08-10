@@ -15,6 +15,7 @@ from inspect import iscoroutinefunction
 from queue import Empty
 from traceback import format_exception
 
+import django
 from django.tasks import TaskResult, task_backends
 from django.tasks.base import TaskContext, TaskError, TaskResultStatus
 from django.tasks.signals import task_finished, task_started
@@ -146,6 +147,7 @@ class WorkerProcess(multiprocessing.Process):
 
     def run(self) -> None:
         """Start consumer execution inside this process."""
+        django.setup()
         logger.info("Starting worker process %s", self.name)
         self.lock = threading.Lock()
         self.expired = threading.Event()
