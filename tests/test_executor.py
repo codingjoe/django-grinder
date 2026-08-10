@@ -22,6 +22,7 @@ from tests.testapp.tasks import (
     boom_retry_raises,
     boom_retry_thrice,
     boom_with_retry,
+    count_users,
     echo,
 )
 from threadmill.backends.base import Broker
@@ -157,6 +158,29 @@ class TestTaskExecutor:
         )
         assert {r.id for r in results} == {r.id for r in enqueued}
         assert all(r.status == TaskResultStatus.SUCCESSFUL for r in results)
+
+    def test_run__executes_model_task_in_spawned_worker(self):
+        """run() executes a model-accessing task in a spawned worker process."""
+        original_start_method = multiprocessing.get_start_method()
+        multiprocessing.set_start_method("spawn", force=True)
+        try:
+            enqueued = default_task_backend.enqueue(count_users)
+            executor = TaskExecutor(
+                backend=default_task_backend,
+                workers=1,
+                threads=1,
+                queues=("default",),
+            )
+            run_thread = threading.Thread(target=executor.run, daemon=True)
+            run_thread.start()
+            time.sleep(3)
+            executor.shutdown()
+            run_thread.join(timeout=5)
+            assert not run_thread.is_alive()
+            result = default_task_backend.get_result(enqueued.id)
+            assert result.status == TaskResultStatus.SUCCESSFUL
+        finally:
+            multiprocessing.set_start_method(original_start_method, force=True)
 
     def test_worker_acquires_updates_and_acknowledges(self):
         """Worker acquires, executes, and acknowledges via its own backend."""
