@@ -98,5 +98,5 @@ ini_options.DJANGO_SETTINGS_MODULE = "tests.testapp.settings"
 
 [tool.coverage]
 run.source = [ "threadmill" ]
-report.show_missing = true
 report.skip_covered = true
+report.show_missing = true
