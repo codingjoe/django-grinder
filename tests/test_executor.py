@@ -7,6 +7,7 @@ import threading
 import time
 import uuid
 
+import pytest
 from django.tasks import (
     TaskContext,
     TaskResult,
@@ -182,6 +183,7 @@ class TestTaskExecutor:
         finally:
             multiprocessing.set_start_method(original_start_method, force=True)
 
+    @pytest.mark.django_db(transaction=True)
     def test_worker_acquires_updates_and_acknowledges(self):
         """Worker acquires, executes, and acknowledges via its own backend."""
         enqueued = default_task_backend.enqueue(echo, args=[42])
@@ -287,6 +289,8 @@ class TestWorkerProcess:
 
 class TestWorkerThread:
     """Tests for the WorkerThread class."""
+
+    pytestmark = pytest.mark.django_db(transaction=True)
 
     def test_execute_task_result__successful_execution(self):
         """execute_task_result runs a task and returns SUCCESSFUL result."""
