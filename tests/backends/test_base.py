@@ -35,7 +35,7 @@ class BackendDouble(ThreadmillTaskBackend):
     def enqueue(self, task, args, kwargs):
         return TaskResult(
             task=task,
-            id=str(uuid.uuid4()),
+            id=str(uuid.uuid7()),
             status=TaskResultStatus.READY,
             enqueued_at=timezone.now(),
             started_at=None,
@@ -132,7 +132,7 @@ class TestThreadmillTaskBackend:
         task = RetryTask(func=echo.func)
         result = TaskResult(
             task=task,
-            id=str(uuid.uuid4()),
+            id=str(uuid.uuid7()),
             status=TRS.READY,
             enqueued_at=tz.now(),
             started_at=None,
@@ -321,7 +321,7 @@ def _task_result_with_retry(task, *, errors=None, worker_ids=None) -> TaskResult
     now = tz.now()
     return TaskResult(
         task=task,
-        id=str(uuid.uuid4()),
+        id=str(uuid.uuid7()),
         status=TRS.FAILED,
         enqueued_at=now,
         started_at=now,

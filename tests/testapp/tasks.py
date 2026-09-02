@@ -65,7 +65,7 @@ leak = {}
 @task(queue_name="memory")
 def memory_workload():
     """Allocate and leak 100MB of memory."""
-    leak[uuid.uuid4()] = "x" * 1024 * 1024 * 100
+    leak[uuid.uuid7()] = "x" * 1024 * 1024 * 100
 
 
 @task()

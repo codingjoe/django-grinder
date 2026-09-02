@@ -12,7 +12,7 @@ authors = [
 ]
 requires-python = ">=3.14"
 classifiers = [
-  "Development Status :: 4 - Beta",
+  "Development Status :: 5 - Production/Stable",
   "Environment :: Web Environment",
   "Framework :: Django",
   "Framework :: Django :: 6.1",
@@ -98,5 +98,5 @@ ini_options.DJANGO_SETTINGS_MODULE = "tests.testapp.settings"
 
 [tool.coverage]
 run.source = [ "threadmill" ]
-report.show_missing = true
 report.skip_covered = true
+report.show_missing = true

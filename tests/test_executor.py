@@ -48,7 +48,7 @@ def _task_result(task, *args, **kwargs) -> TaskResult:
     """Build a READY `TaskResult` without touching Redis."""
     return TaskResult(
         task=task,
-        id=str(uuid.uuid4()),
+        id=str(uuid.uuid7()),
         status=TaskResultStatus.READY,
         enqueued_at=timezone.now(),
         started_at=None,
