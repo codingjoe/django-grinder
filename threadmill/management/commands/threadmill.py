@@ -10,7 +10,9 @@ from django.tasks import (
     task_backends,
 )
 
-from ...executor import TaskExecutor
+from ...executor import JsonFormatter, TaskExecutor, TextFormatter
+
+log_formatters = {"json": JsonFormatter, "text": TextFormatter}
 
 
 def kill_softly(signum, frame):
@@ -71,6 +73,12 @@ class WorkerCommand(DjangoBaseCommand):
             action="store_true",
             help="Drain the task queue and exit with 0.",
         )
+        parser.add_argument(
+            "--log-format",
+            choices=tuple(log_formatters),
+            default="json",
+            help="Format for worker log records. Defaults to JSON.",
+        )
 
     def handle(
         self,
@@ -83,6 +91,7 @@ class WorkerCommand(DjangoBaseCommand):
         max_tasks,
         max_tasks_jitter,
         exit_empty,
+        log_format,
         **options,
     ):
         match sys.platform:
@@ -109,6 +118,7 @@ class WorkerCommand(DjangoBaseCommand):
             max_tasks_jitter=max_tasks_jitter,
             exit_empty=exit_empty,
             queues=queues,
+            log_formatter=log_formatters[log_format](),
         )
         try:
             exe.run()

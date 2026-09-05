@@ -1,5 +1,6 @@
 import dataclasses
 import datetime
+import json
 import logging
 import multiprocessing
 import sys
@@ -27,7 +28,15 @@ from tests.testapp.tasks import (
     echo,
 )
 from threadmill.backends.base import Broker
-from threadmill.executor import TaskExecutor, WorkerProcess, WorkerThread
+from threadmill.executor import (
+    JsonFormatter,
+    TaskExecutor,
+    TextFormatter,
+    WorkerProcess,
+    WorkerThread,
+    handler,
+    set_log_formatter,
+)
 
 
 @task(queue_name="default")
@@ -71,6 +80,83 @@ def _make_worker(*, max_tasks: int | None = None) -> WorkerProcess:
         backend_alias="default",
         queues=("default",),
     )
+
+
+class TestJsonFormatter:
+    """Tests for the JsonFormatter class."""
+
+    def test_format__returns_json_payload(self) -> None:
+        """Return a JSON object with structured record fields."""
+        record = logging.LogRecord(
+            "multiprocessing",
+            logging.INFO,
+            __file__,
+            1,
+            "Task successful %r",
+            ("abc",),
+            None,
+        )
+        payload = json.loads(JsonFormatter().format(record))
+        assert set(payload) == {
+            "created_at",
+            "level",
+            "logger",
+            "message",
+            "process",
+            "process_name",
+            "thread",
+        }
+        assert payload["message"] == "Task successful 'abc'"
+        assert payload["level"] == "INFO"
+        assert payload["logger"] == "multiprocessing"
+        assert payload["thread"] == "MainThread"
+        assert datetime.datetime.fromisoformat(payload["created_at"]).tzinfo is not None
+
+    def test_format__includes_exception_traceback(self) -> None:
+        """Include the exception traceback when the record carries exc_info."""
+        try:
+            raise ValueError("boom")
+        except ValueError:
+            record = logging.LogRecord(
+                "multiprocessing",
+                logging.ERROR,
+                __file__,
+                1,
+                "Task failed %r",
+                ("abc",),
+                sys.exc_info(),
+            )
+        payload = json.loads(JsonFormatter().format(record))
+        assert "ValueError: boom" in payload["exception"]
+
+
+class TestTextFormatter:
+    """Tests for the TextFormatter class."""
+
+    def test_format__returns_text_record(self) -> None:
+        """Return a human-readable single-line record."""
+        record = logging.LogRecord(
+            "multiprocessing",
+            logging.INFO,
+            __file__,
+            1,
+            "Task successful %r",
+            ("abc",),
+            None,
+        )
+        formatted = TextFormatter().format(record)
+        assert formatted.startswith("INFO: ")
+        assert formatted.endswith(" - Task successful 'abc'")
+
+
+class TestSetLogFormatter:
+    """Tests for the set_log_formatter function."""
+
+    def test_set_log_formatter__sets_handler_formatter(self) -> None:
+        """set_log_formatter swaps the formatter on the shared log handler."""
+        set_log_formatter(TextFormatter())
+        assert isinstance(handler.formatter, TextFormatter)
+        set_log_formatter(JsonFormatter())
 
 
 class TestTaskExecutor:
@@ -132,6 +218,7 @@ class TestTaskExecutor:
         executor = TaskExecutor(backend=default_task_backend, queues=("default",))
         worker = executor.create_worker_process()
         assert worker.is_alive()
+        assert worker.log_formatter is executor.log_formatter
         worker.shutdown()
 
     def test_run__processes_enqueued_tasks_end_to_end(self):
@@ -148,6 +235,7 @@ class TestTaskExecutor:
         run_thread = threading.Thread(target=executor.run, daemon=True)
         run_thread.start()
         time.sleep(2)
+        assert handler.formatter is executor.log_formatter
         executor.shutdown()
         run_thread.join(timeout=5)
         assert not run_thread.is_alive()
@@ -285,6 +373,16 @@ class TestWorkerProcess:
         worker = _make_worker()
         worker.shutdown_requested.set()
         assert worker.shutdown_requested.is_set()
+
+    def test_run__applies_log_formatter_and_stops(self):
+        """run() applies the log formatter and returns when shutdown is requested."""
+        worker = _make_worker()
+        worker.shutdown_requested.set()
+        run_thread = threading.Thread(target=worker.run)
+        run_thread.start()
+        run_thread.join(timeout=5)
+        assert not run_thread.is_alive()
+        assert handler.formatter is worker.log_formatter
 
 
 class TestWorkerThread:

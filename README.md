@@ -97,6 +97,30 @@ All workers will finish the tasks they acquired and acknowledge them.
 You can use `--exit-empty` to exit immediately after all tasks have been processed,
 which might be useful for draining a one-off queue.
 
+#### Logging
+
+Workers log one JSON object per line by default, which is easy to ingest for log collectors:
+
+```json
+{"created_at": "2026-09-05T14:57:25.680105+00:00", "level": "INFO", "logger": "multiprocessing", "message": "Task successful '0198c7bf-8dce-7f7e-9d76-2f3b4a1c5e6d'", "process": 1234, "process_name": "WorkerProcess-1", "thread": "myhost:1234-0"}
+```
+
+Failed tasks include an `exception` field with the traceback.
+
+If you prefer human-readable logs, use the text preset:
+
+```console
+uv run manage.py threadmill worker --log-format text
+```
+
+The formatter remains pluggable. Pass any `logging.Formatter` instance to the executor:
+
+```python
+from threadmill.executor import JsonFormatter, TaskExecutor
+
+TaskExecutor(backend=backend, log_formatter=JsonFormatter())
+```
+
 ### Inspector
 
 ![Inspector TUI screenshot](https://github.com/codingjoe/threadmill/raw/main/docs/images/TUI-screenshot.svg)

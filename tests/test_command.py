@@ -7,6 +7,7 @@ from django.core.management import CommandError, call_command
 from django.tasks import default_task_backend
 
 from tests.testapp.tasks import compute_workload, io_workload, memory_workload
+from threadmill.executor import TextFormatter, handler
 from threadmill.management.commands import threadmill
 
 
@@ -30,6 +31,19 @@ class TestCommand:
         assert parsed_arguments.threads == 1
         assert parsed_arguments.max_tasks == 0
         assert parsed_arguments.max_tasks_jitter == 0
+        assert parsed_arguments.log_format == "json"
+
+    def test_call_command__log_format_text(self):
+        """call_command runs the worker with the text log formatter."""
+        call_command(
+            "threadmill",
+            "worker",
+            verbosity=0,
+            workers=1,
+            exit_empty=True,
+            log_format="text",
+        )
+        assert isinstance(handler.formatter, TextFormatter)
 
     @pytest.mark.benchmark
     def test_call_command__benchmark_compute(
