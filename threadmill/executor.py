@@ -229,11 +229,19 @@ class WorkerThread(threading.Thread):
             try:
                 return task_result.task.retry(TaskContext(task_result=task_result))
             except Exception:
-                logger.exception("Retry callback failed for task %r", task_result.id)
+                logger.exception(
+                    "Retry callback failed for task '%s@%s'",
+                    task_result.id,
+                    task_result.task.module_path,
+                )
 
     def execute_task_result(self, task_result: TaskResult) -> TaskResult:
         """Execute task from task result and update result lifecycle state."""
-        logger.info("Executing task %r", task_result.id)
+        logger.info(
+            "Executing task '%s@%s'",
+            task_result.id,
+            task_result.task.module_path,
+        )
         started_at = timezone.now()
         task_result = dataclasses.replace(
             task_result,
@@ -252,7 +260,11 @@ class WorkerThread(threading.Thread):
                 errors=[*task_result.errors, WorkerThread.create_task_error(exception)],
                 finished_at=timezone.now(),
             )
-            logger.exception("Task failed %r", task_result.id)
+            logger.exception(
+                "Task '%s@%s' failed",
+                task_result.id,
+                task_result.task.module_path,
+            )
         else:
             task_result = dataclasses.replace(
                 task_result,
@@ -262,7 +274,11 @@ class WorkerThread(threading.Thread):
             object.__setattr__(
                 task_result, "_return_value", normalize_json(return_value)
             )
-            logger.info("Task successful %r", task_result.id)
+            logger.info(
+                "Task '%s@%s' succeeded",
+                task_result.id,
+                task_result.task.module_path,
+            )
         finally:
             task_finished.send(TaskExecutor, task_result=task_result)
 
