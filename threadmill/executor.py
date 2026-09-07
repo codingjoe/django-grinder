@@ -17,6 +17,7 @@ from queue import Empty
 from traceback import format_exception
 
 import django
+from django.core.serializers.json import DjangoJSONEncoder
 from django.tasks import TaskResult, task_backends
 from django.tasks.base import TaskContext, TaskError, TaskResultStatus
 from django.tasks.signals import task_finished, task_started
@@ -33,8 +34,8 @@ class JsonFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
         payload = {
             "created_at": datetime.datetime.fromtimestamp(
-                record.created, tz=datetime.UTC
-            ).isoformat(),
+                record.created, tz=timezone.get_current_timezone()
+            ),
             "level": record.levelname,
             "logger": record.name,
             "message": record.getMessage(),
@@ -44,7 +45,7 @@ class JsonFormatter(logging.Formatter):
         }
         if record.exc_info:
             payload["exception"] = "".join(format_exception(*record.exc_info))
-        return json.dumps(payload)
+        return json.dumps(payload, cls=DjangoJSONEncoder)
 
 
 logger = multiprocessing.get_logger()

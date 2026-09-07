@@ -109,7 +109,12 @@ class TestJsonFormatter:
         assert payload["level"] == "INFO"
         assert payload["logger"] == "multiprocessing"
         assert payload["thread"] == "MainThread"
-        assert datetime.datetime.fromisoformat(payload["created_at"]).tzinfo is not None
+        assert (
+            datetime.datetime.fromisoformat(payload["created_at"]).utcoffset()
+            == datetime.datetime.fromtimestamp(
+                record.created, tz=timezone.get_current_timezone()
+            ).utcoffset()
+        )
 
     def test_format__includes_exception_traceback(self) -> None:
         """Include the exception traceback when the record carries exc_info."""
