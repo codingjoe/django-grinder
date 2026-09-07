@@ -21,7 +21,7 @@ uv run manage.py threadmill worker         # run the worker pool
 uv run manage.py threadmill inspector    # launch the textual TUI inspector
 ```
 
-CI additionally pins Django per matrix step: `uv run --with django~=6.1 pytest -m "not benchmark"`.
+CI additionally pins Django per matrix step: `uv run --with django~=6.1.0 pytest -m "not benchmark"`.
 
 Run a single test by node ID, e.g. `uv run pytest tests/test_command.py::TestCommand::test_add_arguments__register_all_worker_options`.
 
