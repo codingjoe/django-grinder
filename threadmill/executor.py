@@ -3,6 +3,7 @@
 import asyncio
 import dataclasses
 import datetime
+import json
 import logging
 import multiprocessing
 import random
@@ -16,6 +17,7 @@ from queue import Empty
 from traceback import format_exception
 
 import django
+from django.core.serializers.json import DjangoJSONEncoder
 from django.tasks import TaskResult, task_backends
 from django.tasks.base import TaskContext, TaskError, TaskResultStatus
 from django.tasks.signals import task_finished, task_started
@@ -25,12 +27,62 @@ from django.utils.json import normalize_json
 if typing.TYPE_CHECKING:
     from .backends.base import Broker, ThreadmillTaskBackend
 
+
+class JsonFormatter(logging.Formatter):
+    """Format log records as single-line JSON objects."""
+
+    standard_attributes = frozenset(
+        {
+            "args",
+            "asctime",
+            "created",
+            "exc_info",
+            "exc_text",
+            "filename",
+            "funcName",
+            "levelname",
+            "levelno",
+            "lineno",
+            "message",
+            "module",
+            "msecs",
+            "msg",
+            "name",
+            "pathname",
+            "process",
+            "processName",
+            "relativeCreated",
+            "stack_info",
+            "taskName",
+            "thread",
+            "threadName",
+        }
+    )
+
+    def format(self, record: logging.LogRecord) -> str:
+        payload = {
+            "created_at": datetime.datetime.fromtimestamp(
+                record.created, tz=timezone.get_current_timezone()
+            ),
+            "level": record.levelname,
+            "logger": record.name,
+            "message": record.getMessage(),
+            "process": record.process,
+            "process_name": record.processName,
+            "thread": record.threadName,
+        } | {
+            key: value
+            for key, value in record.__dict__.items()
+            if key not in self.standard_attributes
+        }
+        if record.exc_info:
+            payload["exception"] = "".join(format_exception(*record.exc_info))
+        return json.dumps(payload, cls=DjangoJSONEncoder)
+
+
 logger = multiprocessing.get_logger()
-formatter = logging.Formatter(
-    "%(levelname)s: %(asctime)s - pid=%(process)s - %(message)s"
-)
 handler = logging.StreamHandler()
-handler.setFormatter(formatter)
+handler.setFormatter(JsonFormatter())
 logger.addHandler(handler)
 logger.setLevel(logging.INFO)
 
@@ -53,6 +105,7 @@ class TaskExecutor:
     queues: tuple[str]
     broker: Broker | None = dataclasses.field(default=None, init=False)
     exit_empty: bool = False
+    log_formatter: logging.Formatter = dataclasses.field(default_factory=JsonFormatter)
 
     def __post_init__(self) -> None:
         """Initialize derived orchestration fields and queues."""
@@ -69,17 +122,19 @@ class TaskExecutor:
     def create_worker_process(self) -> WorkerProcess:
         """Create and start a new worker process."""
         worker = WorkerProcess(
-            self.thread_count,
-            self.get_maximum_tasks_per_child(),
-            self.backend.alias,
-            self.queues,
-            self.exit_empty,
+            thread_count=self.thread_count,
+            max_tasks=self.get_maximum_tasks_per_child(),
+            backend_alias=self.backend.alias,
+            queues=self.queues,
+            exit_empty=self.exit_empty,
+            log_formatter=self.log_formatter,
         )
         worker.start()
         return worker
 
     def run(self) -> None:
         """Start consuming tasks until shutdown is requested."""
+        handler.setFormatter(self.log_formatter)
         self.worker_processes = [
             self.create_worker_process() for _ in range(self.process_count)
         ]
@@ -127,11 +182,13 @@ class WorkerProcess(multiprocessing.Process):
 
     def __init__(
         self,
+        *,
         thread_count: int,
         max_tasks: int | None = None,
         backend_alias: str = "",
         queues: tuple[str, ...] = (),
         exit_empty: bool = False,
+        log_formatter: logging.Formatter,
     ) -> None:
         """Create process with dedicated thread pool for task execution."""
         self.shutdown_requested = multiprocessing.Event()
@@ -141,12 +198,14 @@ class WorkerProcess(multiprocessing.Process):
         self.backend_alias = backend_alias
         self.queues = queues
         self.exit_empty = exit_empty
+        self.log_formatter = log_formatter
         self.task_count = 0
         self.lock: threading.Lock | None = None
         self.expired: threading.Event | None = None
 
     def run(self) -> None:
         """Start consumer execution inside this process."""
+        handler.setFormatter(self.log_formatter)
         django.setup()
         logger.info("Starting worker process %s", self.name)
         self.lock = threading.Lock()

@@ -1,4 +1,6 @@
 import argparse
+import logging
+import re
 import signal
 from unittest.mock import patch
 
@@ -7,7 +9,15 @@ from django.core.management import CommandError, call_command
 from django.tasks import default_task_backend
 
 from tests.testapp.tasks import compute_workload, io_workload, memory_workload
+from threadmill.executor import JsonFormatter, handler
 from threadmill.management.commands import threadmill
+
+
+@pytest.fixture(autouse=True)
+def restore_log_formatter():
+    """Restore the default JSON log formatter after each test."""
+    yield
+    handler.setFormatter(JsonFormatter())
 
 
 class TestKillSoftly:
@@ -30,6 +40,65 @@ class TestCommand:
         assert parsed_arguments.threads == 1
         assert parsed_arguments.max_tasks == 0
         assert parsed_arguments.max_tasks_jitter == 0
+        assert parsed_arguments.log_format is None
+
+    def test_call_command__log_format(self):
+        """Run the worker with the given log format string."""
+        call_command(
+            "threadmill",
+            "worker",
+            verbosity=0,
+            workers=1,
+            exit_empty=True,
+            log_format="%(levelname)s %(message)s",
+        )
+        record = logging.LogRecord(
+            "threadmill", logging.INFO, __file__, 1, "Hello %s", ("world",), None
+        )
+        assert handler.formatter.format(record) == "INFO Hello world"
+
+    @pytest.mark.parametrize("log_format", ["100% done", "%(message)s 100% done", 123])
+    def test_call_command__log_format__raise_command_error(self, log_format):
+        """Raise CommandError for a log format that fails to format a record."""
+        with pytest.raises(
+            CommandError, match=re.escape(f"Invalid log format: {log_format!r}")
+        ):
+            call_command(
+                "threadmill",
+                "worker",
+                verbosity=0,
+                workers=1,
+                exit_empty=True,
+                log_format=log_format,
+            )
+
+    def test_call_command__log_format__defaults_to_json(self):
+        """Default to the JSON log formatter."""
+        handler.setFormatter(logging.Formatter("%(message)s"))
+        call_command(
+            "threadmill",
+            "worker",
+            verbosity=0,
+            workers=1,
+            exit_empty=True,
+        )
+        assert isinstance(handler.formatter, JsonFormatter)
+
+    def test_call_command__log_format__empty_string(self):
+        """Honor an explicitly empty log format string."""
+        handler.setFormatter(JsonFormatter())
+        call_command(
+            "threadmill",
+            "worker",
+            verbosity=0,
+            workers=1,
+            exit_empty=True,
+            log_format="",
+        )
+        record = logging.LogRecord(
+            "threadmill", logging.INFO, __file__, 1, "Hello %s", ("world",), None
+        )
+        assert handler.formatter.format(record) == "Hello world"
 
     @pytest.mark.benchmark
     def test_call_command__benchmark_compute(
