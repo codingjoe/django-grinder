@@ -10,7 +10,12 @@ from django.tasks.signals import task_finished, task_started
 from django.utils import timezone
 
 from tests.testapp.tasks import echo
-from threadmill.executor import TaskExecutor, WorkerProcess, WorkerThread
+from threadmill.executor import (
+    JsonFormatter,
+    TaskExecutor,
+    WorkerProcess,
+    WorkerThread,
+)
 
 
 def _task_result(task, *args) -> TaskResult:
@@ -75,7 +80,10 @@ class TestCloseTaskDatabaseConnection:
             stale_connection, "close", wraps=stale_connection.close
         ) as spy:
             worker = WorkerProcess(
-                thread_count=1, backend_alias="default", queues=("default",)
+                thread_count=1,
+                backend_alias="default",
+                queues=("default",),
+                log_formatter=JsonFormatter(),
             )
             thread = WorkerThread(worker=worker, index=0, backend=None)
 

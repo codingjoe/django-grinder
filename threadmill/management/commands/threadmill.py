@@ -1,3 +1,4 @@
+import logging
 import signal
 import sys
 
@@ -10,9 +11,7 @@ from django.tasks import (
     task_backends,
 )
 
-from ...executor import JsonFormatter, TaskExecutor, TextFormatter
-
-log_formatters = {"json": JsonFormatter, "text": TextFormatter}
+from ...executor import JsonFormatter, TaskExecutor
 
 
 def kill_softly(signum, frame):
@@ -75,9 +74,10 @@ class WorkerCommand(DjangoBaseCommand):
         )
         parser.add_argument(
             "--log-format",
-            choices=tuple(log_formatters),
-            default="json",
-            help="Format for worker log records. Defaults to JSON.",
+            help=(
+                "Logging format string for worker log records, e.g."
+                " '%%(levelname)s %%(message)s'. Defaults to JSON."
+            ),
         )
 
     def handle(
@@ -110,6 +110,17 @@ class WorkerCommand(DjangoBaseCommand):
             raise CommandError(
                 f"Backend does not support all specified queues: {_non_queues!r}"
             )
+        try:
+            log_formatter = (
+                JsonFormatter() if log_format is None else logging.Formatter(log_format)
+            )
+            log_formatter.format(
+                logging.LogRecord(
+                    "threadmill", logging.INFO, __file__, 1, "Ready", (), None
+                )
+            )
+        except (TypeError, ValueError) as e:
+            raise CommandError(f"Invalid log format: {log_format!r}") from e
         exe = TaskExecutor(
             backend=backend,
             workers=workers,
@@ -118,7 +129,7 @@ class WorkerCommand(DjangoBaseCommand):
             max_tasks_jitter=max_tasks_jitter,
             exit_empty=exit_empty,
             queues=queues,
-            log_formatter=log_formatters[log_format](),
+            log_formatter=log_formatter,
         )
         try:
             exe.run()

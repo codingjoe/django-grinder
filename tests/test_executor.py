@@ -31,11 +31,9 @@ from threadmill.backends.base import Broker
 from threadmill.executor import (
     JsonFormatter,
     TaskExecutor,
-    TextFormatter,
     WorkerProcess,
     WorkerThread,
     handler,
-    set_log_formatter,
 )
 
 
@@ -79,6 +77,7 @@ def _make_worker(*, max_tasks: int | None = None) -> WorkerProcess:
         max_tasks=max_tasks,
         backend_alias="default",
         queues=("default",),
+        log_formatter=JsonFormatter(),
     )
 
 
@@ -128,35 +127,6 @@ class TestJsonFormatter:
             )
         payload = json.loads(JsonFormatter().format(record))
         assert "ValueError: boom" in payload["exception"]
-
-
-class TestTextFormatter:
-    """Tests for the TextFormatter class."""
-
-    def test_format__returns_text_record(self) -> None:
-        """Return a human-readable single-line record."""
-        record = logging.LogRecord(
-            "multiprocessing",
-            logging.INFO,
-            __file__,
-            1,
-            "Task successful %r",
-            ("abc",),
-            None,
-        )
-        formatted = TextFormatter().format(record)
-        assert formatted.startswith("INFO: ")
-        assert formatted.endswith(" - Task successful 'abc'")
-
-
-class TestSetLogFormatter:
-    """Tests for the set_log_formatter function."""
-
-    def test_set_log_formatter__sets_handler_formatter(self) -> None:
-        """set_log_formatter swaps the formatter on the shared log handler."""
-        set_log_formatter(TextFormatter())
-        assert isinstance(handler.formatter, TextFormatter)
-        set_log_formatter(JsonFormatter())
 
 
 class TestTaskExecutor:

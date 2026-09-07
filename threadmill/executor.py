@@ -31,7 +31,6 @@ class JsonFormatter(logging.Formatter):
     """Format log records as single-line JSON objects."""
 
     def format(self, record: logging.LogRecord) -> str:
-        """Return the record as a JSON object with structured fields."""
         payload = {
             "created_at": datetime.datetime.fromtimestamp(
                 record.created, tz=datetime.UTC
@@ -48,24 +47,11 @@ class JsonFormatter(logging.Formatter):
         return json.dumps(payload)
 
 
-class TextFormatter(logging.Formatter):
-    """Format log records as single-line human-readable text."""
-
-    def __init__(self) -> None:
-        """Initialize the formatter with the default text format."""
-        super().__init__("%(levelname)s: %(asctime)s - pid=%(process)s - %(message)s")
-
-
 logger = multiprocessing.get_logger()
 handler = logging.StreamHandler()
 handler.setFormatter(JsonFormatter())
 logger.addHandler(handler)
 logger.setLevel(logging.INFO)
-
-
-def set_log_formatter(formatter: logging.Formatter) -> None:
-    """Set the formatter for records logged by the multiprocessing logger."""
-    handler.setFormatter(formatter)
 
 
 @dataclasses.dataclass(kw_only=True, slots=True)
@@ -103,19 +89,19 @@ class TaskExecutor:
     def create_worker_process(self) -> WorkerProcess:
         """Create and start a new worker process."""
         worker = WorkerProcess(
-            self.thread_count,
-            self.get_maximum_tasks_per_child(),
-            self.backend.alias,
-            self.queues,
-            self.exit_empty,
-            self.log_formatter,
+            thread_count=self.thread_count,
+            max_tasks=self.get_maximum_tasks_per_child(),
+            backend_alias=self.backend.alias,
+            queues=self.queues,
+            exit_empty=self.exit_empty,
+            log_formatter=self.log_formatter,
         )
         worker.start()
         return worker
 
     def run(self) -> None:
         """Start consuming tasks until shutdown is requested."""
-        set_log_formatter(self.log_formatter)
+        handler.setFormatter(self.log_formatter)
         self.worker_processes = [
             self.create_worker_process() for _ in range(self.process_count)
         ]
@@ -163,12 +149,13 @@ class WorkerProcess(multiprocessing.Process):
 
     def __init__(
         self,
+        *,
         thread_count: int,
         max_tasks: int | None = None,
         backend_alias: str = "",
         queues: tuple[str, ...] = (),
         exit_empty: bool = False,
-        log_formatter: logging.Formatter | None = None,
+        log_formatter: logging.Formatter,
     ) -> None:
         """Create process with dedicated thread pool for task execution."""
         self.shutdown_requested = multiprocessing.Event()
@@ -178,14 +165,14 @@ class WorkerProcess(multiprocessing.Process):
         self.backend_alias = backend_alias
         self.queues = queues
         self.exit_empty = exit_empty
-        self.log_formatter = log_formatter or JsonFormatter()
+        self.log_formatter = log_formatter
         self.task_count = 0
         self.lock: threading.Lock | None = None
         self.expired: threading.Event | None = None
 
     def run(self) -> None:
         """Start consumer execution inside this process."""
-        set_log_formatter(self.log_formatter)
+        handler.setFormatter(self.log_formatter)
         django.setup()
         logger.info("Starting worker process %s", self.name)
         self.lock = threading.Lock()
