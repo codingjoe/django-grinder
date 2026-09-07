@@ -116,6 +116,23 @@ class TestJsonFormatter:
             ).utcoffset()
         )
 
+    def test_format__includes_extra_attributes(self) -> None:
+        """Include extra record attributes in the JSON payload."""
+        record = logging.LogRecord(
+            "multiprocessing",
+            logging.INFO,
+            __file__,
+            1,
+            "Task successful %r",
+            ("abc",),
+            None,
+        )
+        record.request_id = "abc"
+        record.duration_ms = 42
+        payload = json.loads(JsonFormatter().format(record))
+        assert payload["request_id"] == "abc"
+        assert payload["duration_ms"] == 42
+
     def test_format__includes_exception_traceback(self) -> None:
         """Include the exception traceback when the record carries exc_info."""
         try:

@@ -31,6 +31,34 @@ if typing.TYPE_CHECKING:
 class JsonFormatter(logging.Formatter):
     """Format log records as single-line JSON objects."""
 
+    standard_attributes = frozenset(
+        {
+            "args",
+            "asctime",
+            "created",
+            "exc_info",
+            "exc_text",
+            "filename",
+            "funcName",
+            "levelname",
+            "levelno",
+            "lineno",
+            "message",
+            "module",
+            "msecs",
+            "msg",
+            "name",
+            "pathname",
+            "process",
+            "processName",
+            "relativeCreated",
+            "stack_info",
+            "taskName",
+            "thread",
+            "threadName",
+        }
+    )
+
     def format(self, record: logging.LogRecord) -> str:
         payload = {
             "created_at": datetime.datetime.fromtimestamp(
@@ -43,6 +71,13 @@ class JsonFormatter(logging.Formatter):
             "process_name": record.processName,
             "thread": record.threadName,
         }
+        payload.update(
+            {
+                key: value
+                for key, value in record.__dict__.items()
+                if key not in self.standard_attributes
+            }
+        )
         if record.exc_info:
             payload["exception"] = "".join(format_exception(*record.exc_info))
         return json.dumps(payload, cls=DjangoJSONEncoder)
