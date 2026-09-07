@@ -114,16 +114,25 @@ uv run manage.py threadmill inspector
 The `RedisTaskBackend` accepts the following options under `OPTIONS` in your
 `TASKS` configuration:
 
-| Option            | Default                | Description                                                  |
-| ----------------- | ---------------------- | ------------------------------------------------------------ |
-| `lease_ttl`       | `timedelta(hours=1)`   | Max processing time before a started task is marked FAILED.  |
-| `result_ttl`      | `timedelta(days=1)`    | How long task results are retained before automatic removal. |
-| `broker_interval` | `timedelta(seconds=1)` | Interval between background broker maintenance passes.       |
-| `batch_size`      | `100`                  | Max tasks to move or requeue per broker pass.                |
+| Option              | Default                   | Description                                                             |
+| ------------------- | ------------------------- | ----------------------------------------------------------------------- |
+| `lease_ttl`         | `timedelta(hours=1)`      | Max processing time before a started task is marked FAILED.             |
+| `result_ttl`        | `timedelta(days=1)`       | How long task results are retained before automatic removal.            |
+| `broker_interval`   | `timedelta(seconds=1)`    | Interval between background broker maintenance passes.                  |
+| `batch_size`        | `100`                     | Max tasks to move or requeue per broker pass.                           |
+| `poll_interval`     | `timedelta(seconds=0.01)` | Base wait between idle acquire attempts, doubled after each empty poll. |
+| `poll_max_interval` | `timedelta(seconds=1)`    | Max wait between idle acquire attempts.                                 |
 
 A task that is started but never acknowledged (lease expired) is marked FAILED
 with an `AcknowledgementTimeout` error. Set `lease_ttl` comfortably above your
 worst-case task runtime.
+
+Idle workers double their wait between acquire attempts, from `poll_interval`
+up to `poll_max_interval` (default 1 second), and reset on task pickup, so idle
+CPU usage stays low while empty-queue pickup latency is bounded by
+`poll_max_interval`. The doubling is driven by a counter shared across a worker
+process's consumer threads, so a process running more than one thread reaches
+`poll_max_interval` sooner.
 
 All keys for one backend alias share a Redis Cluster hash tag (`{alias}`), so
 every multi-key operation — including the cross-queue acquire — runs on a single
