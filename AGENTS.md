@@ -4,7 +4,7 @@ Compact guidance for OpenCode sessions working in this repo. Read `CONTRIBUTING.
 
 ## Project
 
-Queue-agnostic worker pool for Django's task framework. Targets Django 6.1 (alpha/dev) and Python >=3.12. Package: `threadmill/`. Tests: `tests/` with a Django test app at `tests/testapp/`.
+Queue-agnostic worker pool for Django's task framework. Package: `threadmill/`. Tests: `tests/` with a Django test app at `tests/testapp/`.
 
 ## Commands
 
