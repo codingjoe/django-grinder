@@ -70,14 +70,12 @@ class JsonFormatter(logging.Formatter):
             "process": record.process,
             "process_name": record.processName,
             "thread": record.threadName,
-        }
-        payload.update(
-            {
+            **{
                 key: value
                 for key, value in record.__dict__.items()
                 if key not in self.standard_attributes
-            }
-        )
+            },
+        }
         if record.exc_info:
             payload["exception"] = "".join(format_exception(*record.exc_info))
         return json.dumps(payload, cls=DjangoJSONEncoder)
