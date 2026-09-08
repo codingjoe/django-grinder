@@ -96,6 +96,8 @@ class TaskExecutor:
     threads: int = 1
     max_tasks: int = 0
     max_tasks_jitter: int = 0
+    poll_interval: datetime.timedelta = datetime.timedelta(seconds=0.01)
+    poll_max_interval: datetime.timedelta = datetime.timedelta(seconds=1)
     is_publishing: bool = dataclasses.field(default=True, init=False)
     worker_processes: list[WorkerProcess] = dataclasses.field(
         default_factory=list, init=False
@@ -127,6 +129,8 @@ class TaskExecutor:
             backend_alias=self.backend.alias,
             queues=self.queues,
             exit_empty=self.exit_empty,
+            poll_interval=self.poll_interval,
+            poll_max_interval=self.poll_max_interval,
             log_formatter=self.log_formatter,
         )
         worker.start()
@@ -188,6 +192,8 @@ class WorkerProcess(multiprocessing.Process):
         backend_alias: str = "",
         queues: tuple[str, ...] = (),
         exit_empty: bool = False,
+        poll_interval: datetime.timedelta = datetime.timedelta(seconds=0.01),
+        poll_max_interval: datetime.timedelta = datetime.timedelta(seconds=1),
         log_formatter: logging.Formatter,
     ) -> None:
         """Create process with dedicated thread pool for task execution."""
@@ -198,6 +204,8 @@ class WorkerProcess(multiprocessing.Process):
         self.backend_alias = backend_alias
         self.queues = queues
         self.exit_empty = exit_empty
+        self.poll_interval = poll_interval
+        self.poll_max_interval = poll_max_interval
         self.log_formatter = log_formatter
         self.task_count = 0
         self.lock: threading.Lock | None = None
@@ -211,6 +219,8 @@ class WorkerProcess(multiprocessing.Process):
         self.lock = threading.Lock()
         self.expired = threading.Event()
         backend = task_backends[self.backend_alias]
+        backend.poll_interval = self.poll_interval
+        backend.poll_max_interval = self.poll_max_interval
         consumer_threads = [
             WorkerThread(worker=self, index=index, backend=backend)
             for index in range(self.thread_count)

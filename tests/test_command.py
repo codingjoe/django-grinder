@@ -1,4 +1,5 @@
 import argparse
+import datetime
 import logging
 import re
 import signal
@@ -40,7 +41,19 @@ class TestCommand:
         assert parsed_arguments.threads == 1
         assert parsed_arguments.max_tasks == 0
         assert parsed_arguments.max_tasks_jitter == 0
+        assert parsed_arguments.poll_interval == 0.01
+        assert parsed_arguments.poll_max_interval == 1
         assert parsed_arguments.log_format is None
+
+    def test_add_arguments__parse_poll_intervals_as_floats(self):
+        """Parse poll options as floats."""
+        parser = argparse.ArgumentParser()
+        threadmill.WorkerCommand().add_arguments(parser)
+        parsed_arguments = parser.parse_args(
+            ["--poll-interval", "0.05", "--poll-max-interval", "0.2"]
+        )
+        assert parsed_arguments.poll_interval == 0.05
+        assert parsed_arguments.poll_max_interval == 0.2
 
     def test_call_command__log_format(self):
         """Run the worker with the given log format string."""
@@ -99,6 +112,28 @@ class TestCommand:
             "threadmill", logging.INFO, __file__, 1, "Hello %s", ("world",), None
         )
         assert handler.formatter.format(record) == "Hello world"
+
+    def test_call_command__poll_intervals(self):
+        """Convert poll options to timedeltas for the task executor."""
+        with patch.object(threadmill.TaskExecutor, "run", autospec=True) as run:
+            call_command(
+                "threadmill",
+                "worker",
+                verbosity=0,
+                poll_interval=0.05,
+                poll_max_interval=0.2,
+            )
+        executor = run.call_args.args[0]
+        assert executor.poll_interval == datetime.timedelta(seconds=0.05)
+        assert executor.poll_max_interval == datetime.timedelta(seconds=0.2)
+
+    def test_call_command__poll_intervals__default_to_backend_defaults(self):
+        """Pass the backend default poll options to the task executor by default."""
+        with patch.object(threadmill.TaskExecutor, "run", autospec=True) as run:
+            call_command("threadmill", "worker", verbosity=0)
+        executor = run.call_args.args[0]
+        assert executor.poll_interval == datetime.timedelta(seconds=0.01)
+        assert executor.poll_max_interval == datetime.timedelta(seconds=1)
 
     @pytest.mark.benchmark
     def test_call_command__benchmark_compute(

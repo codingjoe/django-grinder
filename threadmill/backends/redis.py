@@ -155,6 +155,13 @@ class RedisTaskBackend(ThreadmillTaskBackend):
         self.lease_ttl = self.options.get("lease_ttl", datetime.timedelta(hours=1))
         self.result_ttl = self.options.get("result_ttl", datetime.timedelta(days=1))
         self.batch_size = self.options.get("batch_size", 100)
+        self.poll_interval = self.options.get(
+            "poll_interval", datetime.timedelta(seconds=0.01)
+        )
+        self.poll_max_interval = self.options.get(
+            "poll_max_interval", datetime.timedelta(seconds=1)
+        )
+        self._miss_count = 0
         self._acquire_script = self.client.register_script(self.ACQUIRE_SCRIPT)
         self._acknowledge_script = self.client.register_script(self.ACKNOWLEDGE_SCRIPT)
 
@@ -270,17 +277,25 @@ class RedisTaskBackend(ThreadmillTaskBackend):
                     str(int(self.lease_ttl.total_seconds() * 1000)),
                 ],
             ):
+                self._miss_count = 0
                 return self.deserialize_task_result(data)
 
             try:
-                if deadline - time.monotonic() <= 0:
-                    raise TimeoutError(
-                        "No task available within the specified timeout."
-                    )
+                remaining = deadline - time.monotonic()
             except TypeError:
                 raise queue.Empty("No task available.")
-            else:
-                time.sleep(0.01)
+            if remaining <= 0:
+                raise TimeoutError("No task available within the specified timeout.")
+            # Stop doubling once the interval reaches poll_max_interval; larger
+            # exponents would only overflow the float math.
+            cap = int(self.poll_max_interval / self.poll_interval).bit_length()
+            interval_secs = min(
+                self.poll_interval.total_seconds() * 2 ** min(self._miss_count, cap),
+                self.poll_max_interval.total_seconds(),
+                remaining,
+            )
+            self._miss_count += 1
+            time.sleep(interval_secs)
 
     def acknowledge(self, task_result: TaskResult) -> None:
         serialized = self.serialize_task_result(task_result)

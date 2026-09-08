@@ -1,10 +1,14 @@
+import collections.abc
 import dataclasses
 import datetime
 import logging
+import queue
 import time
+import typing
 from dataclasses import replace
 from unittest.mock import patch
 
+import pytest
 from django.tasks import default_task_backend
 from django.tasks.base import TaskResultStatus
 from django.utils import timezone
@@ -36,6 +40,39 @@ def _stats(**overrides: int | datetime.timedelta) -> QueueStats:
         egress=overrides.get("egress", 0),
     )
     return QueueStats(counts=counts, rates=rates)
+
+
+class CountingAcquireScript:
+    """Delegate to the real acquire script while recording each invocation."""
+
+    def __init__(self, script: collections.abc.Callable[..., typing.Any]) -> None:
+        self.script: collections.abc.Callable[..., typing.Any] = script
+        self.calls: list[float] = []
+
+    def __call__(self, **kwargs: typing.Any) -> typing.Any:
+        self.calls.append(time.monotonic())
+        return self.script(**kwargs)
+
+
+def _make_backend(alias: str, **options: datetime.timedelta) -> RedisTaskBackend:
+    """Build a single-queue backend with per-test options."""
+    return RedisTaskBackend(
+        alias,
+        {
+            "QUEUES": ["default"],
+            "REDIS_URL": "redis://localhost:6379/0",
+            "OPTIONS": {
+                "lease_ttl": datetime.timedelta(hours=1),
+                "result_ttl": datetime.timedelta(seconds=60),
+                **options,
+            },
+        },
+    )
+
+
+def _measure_wait_deltas(calls: list[float]) -> list[float]:
+    """Return the seconds elapsed between consecutive recorded script calls."""
+    return [calls[index + 1] - calls[index] for index in range(len(calls) - 1)]
 
 
 class TestRedisBroker:
@@ -971,5 +1008,99 @@ class TestRedisTaskBackend:
                 )
                 == []
             )
+        finally:
+            backend.close()
+
+    def test_acquire__backs_off_when_idle(self):
+        """Idle waits grow so a one-second acquire polls far less than every 10ms."""
+        backend = _make_backend("acquire_backoff_test")
+        backend._acquire_script = CountingAcquireScript(backend._acquire_script)
+        try:
+            started_at = time.monotonic()
+            with pytest.raises(TimeoutError):
+                backend.acquire(timeout=datetime.timedelta(seconds=1))
+            elapsed_secs = time.monotonic() - started_at
+            poll_count = len(backend._acquire_script.calls)
+            assert elapsed_secs >= 0.99
+            assert 1 < poll_count <= 20
+        finally:
+            backend.close()
+
+    def test_acquire__doubles_wait_up_to_poll_max_interval(self):
+        """Consecutive empty polls double their wait, capped at poll_max_interval."""
+        poll_interval_secs = 0.05
+        poll_max_secs = 0.2
+        backend = _make_backend(
+            "acquire_double_test",
+            poll_interval=datetime.timedelta(seconds=poll_interval_secs),
+            poll_max_interval=datetime.timedelta(seconds=poll_max_secs),
+        )
+        backend._acquire_script = CountingAcquireScript(backend._acquire_script)
+        try:
+            with pytest.raises(TimeoutError):
+                backend.acquire(timeout=datetime.timedelta(seconds=1.5))
+            deltas = _measure_wait_deltas(backend._acquire_script.calls)
+            assert len(deltas) >= 4
+            assert deltas[0] >= poll_interval_secs * 0.8
+            assert deltas[1] >= poll_interval_secs * 1.6
+            assert deltas[2] >= poll_max_secs * 0.75
+            assert max(deltas) <= poll_max_secs + 0.15
+        finally:
+            backend.close()
+
+    def test_acquire__resets_wait_after_success(self):
+        """A successful acquire restarts the next idle sequence at poll_interval."""
+        poll_interval_secs = 0.05
+        backend = _make_backend(
+            "acquire_reset_test",
+            poll_interval=datetime.timedelta(seconds=poll_interval_secs),
+        )
+        script = CountingAcquireScript(backend._acquire_script)
+        backend._acquire_script = script
+        try:
+            with pytest.raises(TimeoutError):
+                backend.acquire(timeout=datetime.timedelta(seconds=1))
+            buildup_end = len(script.calls)
+            buildup_deltas = _measure_wait_deltas(script.calls)
+            # Slow runners inflate deltas, so only bind timing with slack.
+            if len(buildup_deltas) > 2:
+                assert buildup_deltas[2] >= 0.15
+
+            backend.enqueue(echo, args=[1])
+            acquired = backend.acquire(timeout=datetime.timedelta(seconds=1))
+            assert acquired is not None
+            assert len(script.calls) == buildup_end + 1
+
+            with pytest.raises(TimeoutError):
+                backend.acquire(timeout=datetime.timedelta(seconds=0.5))
+            reset_deltas = _measure_wait_deltas(script.calls[buildup_end + 1 :])
+            # Slow runners may only fit the first wait into the budget.
+            assert reset_deltas[0] < max(buildup_deltas)
+            if len(reset_deltas) > 1:
+                assert reset_deltas[1] >= poll_interval_secs * 1.6
+        finally:
+            backend.close()
+
+    def test_acquire__raise_timeout_error_at_deadline(self):
+        """Acquire raises TimeoutError when the deadline passes without a task."""
+        backend = _make_backend("acquire_timeout_test")
+        try:
+            started_at = time.monotonic()
+            with pytest.raises(TimeoutError):
+                backend.acquire(timeout=datetime.timedelta(seconds=0.2))
+            elapsed_secs = time.monotonic() - started_at
+            assert elapsed_secs >= 0.2
+            assert elapsed_secs < 2
+        finally:
+            backend.close()
+
+    def test_acquire__raise_queue_empty_when_timeout_is_none(self):
+        """Acquire without a timeout raises queue.Empty after a single attempt."""
+        backend = _make_backend("acquire_empty_test")
+        backend._acquire_script = CountingAcquireScript(backend._acquire_script)
+        try:
+            with pytest.raises(queue.Empty):
+                backend.acquire()
+            assert len(backend._acquire_script.calls) == 1
         finally:
             backend.close()
