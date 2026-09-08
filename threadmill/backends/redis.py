@@ -161,19 +161,6 @@ class RedisTaskBackend(ThreadmillTaskBackend):
         self.poll_max_interval = self.options.get(
             "poll_max_interval", datetime.timedelta(seconds=1)
         )
-        # Without this guard, sleep(0) spins idle workers unthrottled and a
-        # negative sleep crash-loops the worker pool.
-        if not datetime.timedelta(0) < self.poll_interval <= self.poll_max_interval:
-            raise ValueError(
-                "poll_interval must be a positive timedelta and poll_max_interval "
-                "must be a timedelta of at least poll_interval in your settings "
-                f"for the {type(self).__name__}."
-            )
-        # Stop doubling once the interval reaches poll_max_interval; larger
-        # exponents would only overflow the float math.
-        self._poll_exponent_cap = int(
-            self.poll_max_interval / self.poll_interval
-        ).bit_length()
         self._miss_count = 0
         self._acquire_script = self.client.register_script(self.ACQUIRE_SCRIPT)
         self._acknowledge_script = self.client.register_script(self.ACKNOWLEDGE_SCRIPT)
@@ -299,9 +286,11 @@ class RedisTaskBackend(ThreadmillTaskBackend):
                 raise queue.Empty("No task available.")
             if remaining <= 0:
                 raise TimeoutError("No task available within the specified timeout.")
+            # Stop doubling once the interval reaches poll_max_interval; larger
+            # exponents would only overflow the float math.
+            cap = int(self.poll_max_interval / self.poll_interval).bit_length()
             interval_secs = min(
-                self.poll_interval.total_seconds()
-                * 2 ** min(self._miss_count, self._poll_exponent_cap),
+                self.poll_interval.total_seconds() * 2 ** min(self._miss_count, cap),
                 self.poll_max_interval.total_seconds(),
                 remaining,
             )

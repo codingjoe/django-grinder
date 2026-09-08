@@ -3,7 +3,6 @@ import dataclasses
 import datetime
 import logging
 import queue
-import re
 import time
 import typing
 from dataclasses import replace
@@ -74,13 +73,6 @@ def _make_backend(alias: str, **options: datetime.timedelta) -> RedisTaskBackend
 def _measure_wait_deltas(calls: list[float]) -> list[float]:
     """Return the seconds elapsed between consecutive recorded script calls."""
     return [calls[index + 1] - calls[index] for index in range(len(calls) - 1)]
-
-
-_POLL_OPTIONS_ERROR = re.escape(
-    "poll_interval must be a positive timedelta and poll_max_interval "
-    "must be a timedelta of at least poll_interval in your settings "
-    "for the RedisTaskBackend."
-)
 
 
 class TestRedisBroker:
@@ -1117,62 +1109,5 @@ class TestRedisTaskBackend:
             with pytest.raises(queue.Empty):
                 backend.acquire()
             assert len(backend._acquire_script.calls) == 1
-        finally:
-            backend.close()
-
-    def test_init__raise_value_error_when_poll_interval_is_zero(self):
-        """Raise ValueError when poll_interval is zero."""
-        with pytest.raises(ValueError, match=_POLL_OPTIONS_ERROR):
-            _make_backend("init_zero_test", poll_interval=datetime.timedelta(0))
-
-    def test_init__raise_value_error_when_poll_interval_is_negative(self):
-        """Raise ValueError when poll_interval is negative."""
-        with pytest.raises(ValueError, match=_POLL_OPTIONS_ERROR):
-            _make_backend(
-                "init_negative_test", poll_interval=datetime.timedelta(seconds=-1)
-            )
-
-    def test_init__raise_value_error_when_poll_max_interval_is_below_poll_interval(
-        self,
-    ):
-        """Raise ValueError when poll_max_interval is below poll_interval."""
-        with pytest.raises(ValueError, match=_POLL_OPTIONS_ERROR):
-            _make_backend(
-                "init_max_below_test",
-                poll_interval=datetime.timedelta(seconds=0.1),
-                poll_max_interval=datetime.timedelta(seconds=0.05),
-            )
-
-    def test_init__ok(self):
-        """Set poll attributes when poll_interval is positive and poll_max_interval is at least poll_interval."""
-        poll_interval = datetime.timedelta(seconds=0.05)
-        poll_max_interval = datetime.timedelta(seconds=0.2)
-        backend = _make_backend(
-            "init_ok_test",
-            poll_interval=poll_interval,
-            poll_max_interval=poll_max_interval,
-        )
-        try:
-            assert backend.poll_interval == poll_interval
-            assert backend.poll_max_interval == poll_max_interval
-            # 0.2 / 0.05 == 4 and (4).bit_length() == 3: doubling stops once
-            # the interval reaches poll_max_interval.
-            assert backend._poll_exponent_cap == 3
-        finally:
-            backend.close()
-
-    def test_init__ok_when_poll_max_interval_equals_poll_interval(self):
-        """Set poll attributes when poll_max_interval equals poll_interval."""
-        poll_interval = datetime.timedelta(seconds=0.2)
-        backend = _make_backend(
-            "init_equal_test",
-            poll_interval=poll_interval,
-            poll_max_interval=poll_interval,
-        )
-        try:
-            assert backend.poll_interval == poll_interval
-            assert backend.poll_max_interval == poll_interval
-            # 0.2 / 0.2 == 1 and (1).bit_length() == 1.
-            assert backend._poll_exponent_cap == 1
         finally:
             backend.close()
