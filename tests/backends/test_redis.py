@@ -1022,8 +1022,6 @@ class TestRedisTaskBackend:
             elapsed_secs = time.monotonic() - started_at
             poll_count = len(backend._acquire_script.calls)
             assert elapsed_secs >= 0.99
-            # The former loop polled every 10ms (~100 attempts); doubling the
-            # wait up to the 1s cap yields only a handful of script calls.
             assert 1 < poll_count <= 20
         finally:
             backend.close()
@@ -1064,10 +1062,7 @@ class TestRedisTaskBackend:
                 backend.acquire(timeout=datetime.timedelta(seconds=1))
             buildup_end = len(script.calls)
             buildup_deltas = _measure_wait_deltas(script.calls)
-            # The idle sequence had doubled before the timeout fired. A slow
-            # runner inflates every delta with the script round-trip and
-            # clamps the final delta to the remaining budget, so only bind
-            # the timing when the sequence had room to unfold.
+            # Slow runners inflate deltas, so only bind timing with slack.
             if len(buildup_deltas) > 2:
                 assert buildup_deltas[2] >= 0.15
 
@@ -1079,10 +1074,8 @@ class TestRedisTaskBackend:
             with pytest.raises(TimeoutError):
                 backend.acquire(timeout=datetime.timedelta(seconds=0.5))
             reset_deltas = _measure_wait_deltas(script.calls[buildup_end + 1 :])
-            # The sequence restarted at poll_interval: the first wait is back
-            # below the doubled waits of the idle buildup.
+            # Slow runners may only fit the first wait into the budget.
             assert reset_deltas[0] < max(buildup_deltas)
-            # A loaded runner may only fit the first wait into the budget.
             if len(reset_deltas) > 1:
                 assert reset_deltas[1] >= poll_interval_secs * 1.6
         finally:

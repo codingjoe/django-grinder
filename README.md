@@ -77,8 +77,6 @@ Processes allow for parallel compute (no GIL) while threads are great for low-me
 uv run manage.py threadmill worker --processes 4 --threads 2
 ```
 
-You can also override idle poll timing per worker run with `--poll-interval` and `--poll-max-interval`, in seconds.
-
 #### Health
 
 If your tasks leak memory, you can recycle (restart) the workers after a certain number of tasks have been processed:
@@ -128,13 +126,6 @@ The `RedisTaskBackend` accepts the following options under `OPTIONS` in your
 A task that is started but never acknowledged (lease expired) is marked FAILED
 with an `AcknowledgementTimeout` error. Set `lease_ttl` comfortably above your
 worst-case task runtime.
-
-Idle workers double their wait between acquire attempts, from `poll_interval`
-up to `poll_max_interval` (default 1 second), and reset on task pickup, so idle
-CPU usage stays low while empty-queue pickup latency is bounded by
-`poll_max_interval`. The doubling is driven by a counter shared across a worker
-process's consumer threads, so a process running more than one thread reaches
-`poll_max_interval` sooner.
 
 All keys for one backend alias share a Redis Cluster hash tag (`{alias}`), so
 every multi-key operation — including the cross-queue acquire — runs on a single
