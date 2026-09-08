@@ -1,3 +1,4 @@
+import datetime
 import logging
 import signal
 import sys
@@ -68,6 +69,18 @@ class WorkerCommand(DjangoBaseCommand):
             help="Maximum random jitter to add to the max-tasks value by randint(0, max_tasks_jitter).",
         )
         parser.add_argument(
+            "--poll-interval",
+            type=float,
+            default=0.01,
+            help="Base wait between idle acquire attempts in seconds.",
+        )
+        parser.add_argument(
+            "--poll-max-interval",
+            type=float,
+            default=1,
+            help="Maximum wait between idle acquire attempts in seconds.",
+        )
+        parser.add_argument(
             "--exit-empty",
             action="store_true",
             help="Drain the task queue and exit with 0.",
@@ -90,6 +103,8 @@ class WorkerCommand(DjangoBaseCommand):
         threads,
         max_tasks,
         max_tasks_jitter,
+        poll_interval,
+        poll_max_interval,
         exit_empty,
         log_format,
         **options,
@@ -127,6 +142,8 @@ class WorkerCommand(DjangoBaseCommand):
             threads=threads,
             max_tasks=max_tasks,
             max_tasks_jitter=max_tasks_jitter,
+            poll_interval=datetime.timedelta(seconds=poll_interval),
+            poll_max_interval=datetime.timedelta(seconds=poll_max_interval),
             exit_empty=exit_empty,
             queues=queues,
             log_formatter=log_formatter,

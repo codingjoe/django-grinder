@@ -77,6 +77,8 @@ Processes allow for parallel compute (no GIL) while threads are great for low-me
 uv run manage.py threadmill worker --processes 4 --threads 2
 ```
 
+You can also override idle poll timing per worker run with `--poll-interval` and `--poll-max-interval`, in seconds.
+
 #### Health
 
 If your tasks leak memory, you can recycle (restart) the workers after a certain number of tasks have been processed:

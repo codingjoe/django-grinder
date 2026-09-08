@@ -70,13 +70,20 @@ def _task_result(task, *args, **kwargs) -> TaskResult:
     )
 
 
-def _make_worker(*, max_tasks: int | None = None) -> WorkerProcess:
+def _make_worker(
+    *,
+    max_tasks: int | None = None,
+    poll_interval: datetime.timedelta | None = None,
+    poll_max_interval: datetime.timedelta | None = None,
+) -> WorkerProcess:
     """Build an unstarted `WorkerProcess`."""
     return WorkerProcess(
         thread_count=1,
         max_tasks=max_tasks,
         backend_alias="default",
         queues=("default",),
+        poll_interval=poll_interval,
+        poll_max_interval=poll_max_interval,
         log_formatter=JsonFormatter(),
     )
 
@@ -328,6 +335,33 @@ class TestTaskExecutor:
 
 class TestWorkerProcess:
     """Tests for the WorkerProcess class."""
+
+    @pytest.fixture(autouse=True)
+    def restore_backend_poll_options(self):
+        """Restore the backend poll options after each test."""
+        backend = default_task_backend
+        saved = (backend.poll_interval, backend.poll_max_interval)
+        yield
+        backend.poll_interval, backend.poll_max_interval = saved
+
+    def test_run__applies_poll_overrides_to_backend(self):
+        """Apply poll overrides to the backend before starting consumer threads."""
+        backend = default_task_backend
+        poll_interval = datetime.timedelta(seconds=0.02)
+        poll_max_interval = datetime.timedelta(seconds=0.3)
+        enqueued = backend.enqueue(echo, args=[1])
+        worker = _make_worker(
+            max_tasks=1,
+            poll_interval=poll_interval,
+            poll_max_interval=poll_max_interval,
+        )
+        worker.shutdown_requested.set()
+        # The backend registry resolves one instance per thread; running in this
+        # thread applies the overrides to the instance asserted on below.
+        worker.run()
+        assert backend.poll_interval == poll_interval
+        assert backend.poll_max_interval == poll_max_interval
+        assert backend.get_result(enqueued.id).status is TaskResultStatus.SUCCESSFUL
 
     def test_record_task__increments_count(self):
         """record_task increments task_count."""
